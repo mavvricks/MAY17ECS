@@ -1,0 +1,145 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\Booking;
+use App\Models\BusinessRule;
+use Carbon\Carbon;
+
+class PaymentCalculationService
+{
+    /**
+     * Calculate required payment tranches for a booking based on the event date proximity.
+     * 
+     * @param Booking $booking
+     * @return array
+     */
+    public function calculateTranches(Booking $booking): array
+    {
+        $eventDate = Carbon::parse($booking->event_date)->startOfDay();
+        $createdAt = $booking->created_at ? $booking->created_at->startOfDay() : now()->startOfDay();
+        
+        $daysUntilEvent = $createdAt->diffInDays($eventDate, false);
+        $totalCost = (float) $booking->total_cost;
+        $rules = BusinessRule::getActive();
+        $reservationPct = (float) ($rules->reservation_fee_percentage ?? 10);
+        $downPaymentPct = (float) ($rules->downpayment_percentage ?? 70);
+        $finalPct = (float) ($rules->final_payment_percentage ?? 20);
+        $reservationHours = (int) ($rules->reservation_validity_hours ?? 24);
+        $downPaymentDueDays = (int) ($rules->downpayment_due_days ?? 30);
+        $finalDueDays = (int) ($rules->final_payment_due_days ?? 10);
+
+        // Rush 2: Event is less than 10 days away
+        if ($daysUntilEvent <= 10) {
+            return [
+                [
+                    'name' => 'Final',
+                    'percentage' => 100,
+                    'amount' => $totalCost,
+                    'due_date' => now()->addHours($reservationHours)->toIso8601String(),
+                    'description' => '100% Full Payment required immediately for rush events.',
+                ]
+            ];
+        }
+
+        // Rush 1: Event is less than 1 month, but > 10 days away
+        if ($daysUntilEvent <= $downPaymentDueDays) {
+            $rushPct = $reservationPct + $downPaymentPct;
+            return [
+                [
+                    'name' => 'DownPayment',
+                    'percentage' => $rushPct,
+                    'amount' => $totalCost * ($rushPct / 100),
+                    'due_date' => now()->addHours($reservationHours)->toIso8601String(),
+                    'description' => "Because your event is within {$downPaymentDueDays} days, the reservation fee and down payment are combined into a single {$rushPct}% payment required immediately to secure the date.",
+                ],
+                [
+                    'name' => 'Final',
+                    'percentage' => $finalPct,
+                    'amount' => $totalCost * ($finalPct / 100),
+                    'due_date' => $eventDate->copy()->subDays($finalDueDays)->toIso8601String(),
+                    'description' => "{$finalPct}% Final Balance due {$finalDueDays} days before the event.",
+                ]
+            ];
+        }
+
+        // Standard: Event is > 1 month away
+        return [
+            [
+                'name' => 'Reservation',
+                'percentage' => $reservationPct,
+                'amount' => $totalCost * ($reservationPct / 100),
+                'due_date' => now()->addHours($reservationHours)->toIso8601String(),
+                'description' => "{$reservationPct}% Reservation Fee to lock in your date.",
+            ],
+            [
+                'name' => 'DownPayment',
+                'percentage' => $downPaymentPct,
+                'amount' => $totalCost * ($downPaymentPct / 100),
+                'due_date' => $eventDate->copy()->subDays($downPaymentDueDays)->toIso8601String(),
+                'description' => "{$downPaymentPct}% Down Payment due {$downPaymentDueDays} days before the event.",
+            ],
+            [
+                'name' => 'Final',
+                'percentage' => $finalPct,
+                'amount' => $totalCost * ($finalPct / 100),
+                'due_date' => $eventDate->copy()->subDays($finalDueDays)->toIso8601String(),
+                'description' => "{$finalPct}% Final Balance due {$finalDueDays} days before the event.",
+            ]
+        ];
+    }
+
+    /**
+     * Check if the booking is within the non-refundable window (7 days before event).
+     * 
+     * @param Booking $booking
+     * @return bool
+     */
+    public function isNonRefundable(Booking $booking): bool
+    {
+        $eventDate = Carbon::parse($booking->event_date)->startOfDay();
+        $daysUntilEvent = now()->startOfDay()->diffInDays($eventDate, false);
+
+        // If the event is in the past, or less than or equal to 7 days away
+        return $daysUntilEvent <= 7;
+    }
+
+    /**
+     * Get the next sequential payment due, ignoring future tranches.
+     * Evaluates the event proximity and outstanding payments.
+     * 
+     * @param Booking $booking
+     * @return array|null
+     */
+    public function getNextPaymentDue(Booking $booking): ?array
+    {
+        // Since tranches are generated dynamically at reservation time (Standard, Rush 1, Rush 2)
+        // we can simply find the earliest pending payment from the database.
+        $nextPayment = $booking->payments()
+            ->whereIn('status', ['Pending', 'Failed', 'Rejected'])
+            ->orderBy('due_date', 'asc')
+            ->first();
+            
+        if (!$nextPayment) {
+            return null; // Fully paid or no pending payments
+        }
+
+        $tranches = $this->calculateTranches($booking);
+        $description = 'Payment due.';
+        foreach ($tranches as $tranche) {
+            if ($tranche['name'] === $nextPayment->payment_type) {
+                $description = $tranche['description'];
+                break;
+            }
+        }
+
+        return [
+            'id' => $nextPayment->id,
+            'payment_type' => $nextPayment->payment_type,
+            'amount' => $nextPayment->amount,
+            'due_date' => $nextPayment->due_date,
+            'status' => $nextPayment->status,
+            'description' => $description,
+        ];
+    }
+}
