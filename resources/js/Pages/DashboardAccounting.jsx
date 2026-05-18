@@ -21,6 +21,7 @@ const DashboardAccounting = () => {
     const [expandedBooking, setExpandedBooking] = useState(null);
     const [receiptModal, setReceiptModal] = useState({ isOpen: false, payment: null, booking: null });
     const [editPaymentModal, setEditPaymentModal] = useState({ isOpen: false, payment: null, booking: null });
+    const [remindingPaymentId, setRemindingPaymentId] = useState(null);
 
     // Refund Management State
     const [refundQueue, setRefundQueue] = useState([]);
@@ -110,31 +111,39 @@ const DashboardAccounting = () => {
         var isOverdue = dueDate && new Date(dueDate) < new Date() && status === 'Pending';
         if (isOverdue) return { cls: 'bg-red-100 text-red-800', text: 'Overdue' };
         if (status === 'Verified') return { cls: 'bg-green-100 text-green-800', text: 'Paid' };
+        if (status === 'Paid') return { cls: 'bg-emerald-100 text-emerald-800', text: 'Paid (Online)' };
         if (status === 'Pending') return { cls: 'bg-yellow-100 text-yellow-800', text: 'Pending' };
         if (status === 'Rejected') return { cls: 'bg-gray-100 text-gray-600', text: 'Rejected' };
         return { cls: 'bg-gray-100 text-gray-600', text: status };
     };
 
+    // Count both manually-verified and PayMongo-auto-paid payments as "paid"
+    const isPaidStatus = (status) => status === 'Verified' || status === 'Paid';
+
     const getBookingProgress = (payments) => {
-        var verified = payments.filter(function (p) { return p.status === 'Verified'; }).length;
+        var verified = payments.filter(function (p) { return isPaidStatus(p.status); }).length;
         return { verified: verified, total: payments.length };
     };
 
     const handleSendReminder = async (paymentId) => {
+        if (remindingPaymentId === paymentId) return; // prevent double-click
+        setRemindingPaymentId(paymentId);
         try {
-            // Session auth - no token needed
             const res = await fetch(`/api/accounting/remind/${paymentId}`, {
                 method: 'POST',
-                headers: { }
+                headers: { 'Content-Type': 'application/json' }
             });
-            if (res.ok) {
-                setToast({ message: 'Reminder sent to client successfully!', type: 'success' });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
+                setToast({ message: data.message || 'Reminder sent to client successfully!', type: 'success' });
             } else {
-                setToast({ message: 'Failed to send reminder.', type: 'error' });
+                setToast({ message: data.error || 'Failed to send reminder.', type: 'error' });
             }
         } catch (error) {
-            console.error("Error sending reminder:", error);
-            setToast({ message: 'Error sending reminder.', type: 'error' });
+            console.error('Error sending reminder:', error);
+            setToast({ message: 'Network error while sending reminder.', type: 'error' });
+        } finally {
+            setRemindingPaymentId(null);
         }
     };
 
@@ -308,7 +317,7 @@ const DashboardAccounting = () => {
                                         var isExpanded = expandedBooking === booking.id;
                                         var totalCost = booking.totalCost || 0;
                                         var paidAmount = booking.payments
-                                            .filter(function (p) { return p.status === 'Verified'; })
+                                            .filter(function (p) { return isPaidStatus(p.status); })
                                             .reduce(function (sum, p) { return sum + p.amount; }, 0);
                                         var remainingBalance = totalCost - paidAmount;
 
@@ -439,16 +448,26 @@ const DashboardAccounting = () => {
                                                                                             {(payment.status === 'Pending' || new Date(payment.due_date) < new Date()) && (
                                                                                                 <button
                                                                                                     onClick={function (e) { e.stopPropagation(); handleSendReminder(payment.id); }}
-                                                                                                    className="bg-yellow-500 hover:bg-yellow-600 text-white px-3 py-1 rounded-lg text-xs font-medium shadow-sm transition-colors flex items-center gap-1"
+                                                                                                    disabled={remindingPaymentId === payment.id}
+                                                                                                    className={"bg-yellow-500 hover:bg-yellow-600 text-white px-3 py-1 rounded-lg text-xs font-medium shadow-sm transition-colors flex items-center gap-1" + (remindingPaymentId === payment.id ? ' opacity-75 cursor-not-allowed' : '')}
                                                                                                 >
-                                                                                                    <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
-                                                                                                    Remind
+                                                                                                    {remindingPaymentId === payment.id ? (
+                                                                                                        <>
+                                                                                                            <svg className="w-3 h-3 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                                                                                                            Sending...
+                                                                                                        </>
+                                                                                                    ) : (
+                                                                                                        <>
+                                                                                                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg>
+                                                                                                            Remind
+                                                                                                        </>
+                                                                                                    )}
                                                                                                 </button>
                                                                                             )}
                                                                                         </div>
-                                                                                    ) : payment.status === 'Verified' ? (
+                                                                                    ) : isPaidStatus(payment.status) ? (
                                                                                         <div className="flex justify-end items-center gap-3">
-                                                                                            <span className="text-green-600 text-xs font-medium">Verified</span>
+                                                                                            <span className="text-green-600 text-xs font-medium">{payment.status === 'Paid' ? 'Paid' : 'Verified'}</span>
                                                                                             <button
                                                                                                 onClick={function (e) { e.stopPropagation(); setReceiptModal({ isOpen: true, payment: payment, booking: booking }); }}
                                                                                                 className="text-primary-600 hover:text-primary-800 text-xs font-medium underline flex items-center gap-1"

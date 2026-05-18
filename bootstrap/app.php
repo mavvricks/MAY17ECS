@@ -25,6 +25,7 @@ return Application::configure(basePath: dirname(__DIR__))
         // use fetch() for API calls without CSRF tokens.
         $middleware->validateCsrfTokens(except: [
             'api/*',
+            'webhook/paymongo',
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {

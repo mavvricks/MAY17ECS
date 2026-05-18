@@ -15,6 +15,7 @@ use App\Http\Controllers\NotificationController;
 use App\Http\Controllers\MarketingController;
 use App\Http\Controllers\PackageController;
 use App\Http\Controllers\PaymentController;
+use App\Http\Controllers\PayMongoWebhookController;
 use App\Http\Controllers\SettingsController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -35,6 +36,7 @@ use Inertia\Inertia;
 Route::get('/', fn () => Inertia::render('LandingPage'))->name('home');
 Route::get('/about', fn () => Inertia::render('About'))->name('about');
 Route::get('/contact', fn () => Inertia::render('Contact'))->name('contact');
+Route::post('/webhook/paymongo', PayMongoWebhookController::class)->name('webhook.paymongo');
 
 Route::middleware('guest')->group(function () {
     Route::get('/login', fn () => Inertia::render('Login'))->name('login');
@@ -126,6 +128,7 @@ Route::middleware(['auth', 'role:Client'])->group(function () {
     Route::get('/checkout/secure', [PaymentController::class, 'showSecureCheckout'])->middleware('signed')->name('checkout.secure');
     Route::post('/checkout/process', [PaymentController::class, 'processPayment'])->name('checkout.process');
     Route::get('/checkout/success', fn () => Inertia::render('client/PaymentSuccess'))->name('checkout.success');
+    Route::get('/checkout/cancelled', fn () => Inertia::render('client/PaymentCancelled'))->name('checkout.cancelled');
 
     // Dashboard data API (used by original ClientDashboard.jsx fetch calls)
     Route::get('/api/dashboard/client', [ClientDashboardController::class, 'apiData']);

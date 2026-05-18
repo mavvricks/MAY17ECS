@@ -4,6 +4,7 @@ import { useToast } from '../context/ToastContext';
 import { router } from '@inertiajs/react';
 import StaffMessaging from '../Components/common/StaffMessaging';
 import NotificationBell from '../Components/common/NotificationBell';
+import FlashToast from '../Components/common/FlashToast';
 
 const DashboardMarketing = () => {
     const { user, logout } = useAuth();
@@ -22,6 +23,7 @@ const DashboardMarketing = () => {
     const [activeConfigTab, setActiveConfigTab] = useState('packages');
     const [packageForm, setPackageForm] = useState({ name: '', type: '', base_price_per_head: '', minimum_pax: 50, description: '', inclusions: '' });
     const [settingsSaving, setSettingsSaving] = useState(false);
+    const [updatingBookingIds, setUpdatingBookingIds] = useState({});
 
     // PDF Export State
     const [showExportModal, setShowExportModal] = useState(false);
@@ -71,8 +73,13 @@ const DashboardMarketing = () => {
     };
 
     const updateStatus = async (id, newStatus) => {
+        if (updatingBookingIds[id]) return; // prevent double-click
+        setUpdatingBookingIds(prev => ({ ...prev, [id]: newStatus }));
+
+        // Optimistic update: remove from pending list immediately
+        setBookings(prev => prev.map(b => b.id === id ? { ...b, status: newStatus } : b));
+
         try {
-            // Session auth - no token needed
             const response = await fetch(`/api/marketing/bookings/${id}/status`, {
                 method: 'PUT',
                 headers: {
@@ -83,10 +90,20 @@ const DashboardMarketing = () => {
             });
 
             if (response.ok) {
-                fetchBookings();
+                const label = newStatus === 'Confirmed' ? 'approved' : 'declined';
+                toast.success(`Booking #${id} has been ${label} successfully.`);
+                fetchBookings(); // sync with server in background
+            } else {
+                // Revert on failure
+                setBookings(prev => prev.map(b => b.id === id ? { ...b, status: 'Pending' } : b));
+                toast.error('Failed to update booking status. Please try again.');
             }
         } catch (error) {
-            console.error("Error updating status:", error);
+            console.error('Error updating status:', error);
+            setBookings(prev => prev.map(b => b.id === id ? { ...b, status: 'Pending' } : b));
+            toast.error('Network error. Please check your connection.');
+        } finally {
+            setUpdatingBookingIds(prev => { const n = { ...prev }; delete n[id]; return n; });
         }
     };
 
@@ -787,8 +804,30 @@ const DashboardMarketing = () => {
                                                 </p>
                                             </div>
                                             <div className="mt-4 flex items-center text-sm sm:mt-0 space-x-3">
-                                                <button onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Confirmed'); }} className="bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 font-medium px-4 py-1.5 rounded-lg transition-colors">Approve</button>
-                                                <button onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Cancelled'); }} className="bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 font-medium px-4 py-1.5 rounded-lg transition-colors">Reject</button>
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Confirmed'); }}
+                                                    disabled={!!updatingBookingIds[booking.id]}
+                                                    className={`inline-flex items-center gap-1.5 bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 font-medium px-4 py-1.5 rounded-lg transition-colors${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
+                                                >
+                                                    {updatingBookingIds[booking.id] === 'Confirmed' ? (
+                                                        <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                                                    ) : (
+                                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                                    )}
+                                                    Approve
+                                                </button>
+                                                <button
+                                                    onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Cancelled'); }}
+                                                    disabled={!!updatingBookingIds[booking.id]}
+                                                    className={`inline-flex items-center gap-1.5 bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 font-medium px-4 py-1.5 rounded-lg transition-colors${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
+                                                >
+                                                    {updatingBookingIds[booking.id] === 'Cancelled' ? (
+                                                        <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                                                    ) : (
+                                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                                    )}
+                                                    Reject
+                                                </button>
                                             </div>
                                         </div>
                                     </div>
@@ -815,8 +854,30 @@ const DashboardMarketing = () => {
                                         <p className="flex justify-between text-sm"><span className="text-gray-500 font-medium">Budget</span><span className="font-bold text-primary-700">₱{booking.budget?.toLocaleString() || 'N/A'}</span></p>
                                     </div>
                                     <div className="flex gap-3">
-                                        <button onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Confirmed'); }} className="flex-1 bg-green-50 text-green-700 hover:bg-green-100 font-bold py-2.5 rounded-lg text-sm transition-colors border border-green-200 shadow-sm">Approve</button>
-                                        <button onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Cancelled'); }} className="flex-1 bg-red-50 text-red-700 hover:bg-red-100 font-bold py-2.5 rounded-lg text-sm transition-colors border border-red-200 shadow-sm">Reject</button>
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Confirmed'); }}
+                                            disabled={!!updatingBookingIds[booking.id]}
+                                            className={`flex-1 inline-flex items-center justify-center gap-2 bg-green-50 text-green-700 hover:bg-green-100 font-bold py-2.5 rounded-lg text-sm transition-colors border border-green-200 shadow-sm${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
+                                        >
+                                            {updatingBookingIds[booking.id] === 'Confirmed' ? (
+                                                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                                            ) : (
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                                            )}
+                                            Approve
+                                        </button>
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Cancelled'); }}
+                                            disabled={!!updatingBookingIds[booking.id]}
+                                            className={`flex-1 inline-flex items-center justify-center gap-2 bg-red-50 text-red-700 hover:bg-red-100 font-bold py-2.5 rounded-lg text-sm transition-colors border border-red-200 shadow-sm${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
+                                        >
+                                            {updatingBookingIds[booking.id] === 'Cancelled' ? (
+                                                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
+                                            ) : (
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+                                            )}
+                                            Reject
+                                        </button>
                                     </div>
                                 </div>
                             </div>
@@ -1287,6 +1348,7 @@ const DashboardMarketing = () => {
             </main>
             {renderBookingModal()}
             {renderExportModal()}
+            <FlashToast />
         </div>
     );
 };

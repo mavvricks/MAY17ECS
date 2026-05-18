@@ -4,10 +4,13 @@ namespace App\Http\Controllers;
 
 use App\Models\Booking;
 use App\Models\Payment;
+use App\Models\User;
+use App\Notifications\PaymentReminderNotification;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 use Inertia\Inertia;
 
 /**
@@ -288,20 +291,114 @@ class AccountingController extends Controller
     }
 
     /**
-     * Send a payment reminder (simulated).
+     * Send a real payment reminder email + in-app notification to the client.
      * Ported from: accountingController.remindClient()
      */
     public function remindClient(int $paymentId)
     {
-        $payment = Payment::with('booking:id,client_email,client_phone')->find($paymentId);
+        $payment = Payment::with([
+            'booking:id,user_id,client_email,client_full_name,client_phone',
+        ])->find($paymentId);
 
         if (!$payment) {
             return response()->json(['error' => 'Payment not found'], 404);
         }
 
-        Log::info("[SIMULATED NOTIFICATION] Reminder sent to {$payment->booking->client_email} for payment #{$paymentId} due on {$payment->due_date}");
+        $booking = $payment->booking;
 
-        return response()->json(['success' => true, 'message' => 'Reminder sent successfully']);
+        if (!$booking) {
+            return response()->json(['error' => 'Booking not found for this payment'], 404);
+        }
+
+        // Ensure the payment has its booking eager-loaded for the notification
+        $payment->setRelation('booking', $booking);
+
+        $notified = false;
+
+        // ── Path A: Booking has a registered user account ──
+        if ($booking->user_id) {
+            $client = User::find($booking->user_id);
+
+            if ($client) {
+                try {
+                    $client->notify(new PaymentReminderNotification($payment));
+                    $notified = true;
+
+                    Log::info('Payment reminder notification sent.', [
+                        'payment_id' => $paymentId,
+                        'user_id'    => $client->id,
+                        'email'      => $client->email,
+                    ]);
+                } catch (\Throwable $e) {
+                    Log::error('PaymentReminderNotification failed.', [
+                        'payment_id' => $paymentId,
+                        'error'      => $e->getMessage(),
+                    ]);
+
+                    return response()->json([
+                        'error' => 'Could not send reminder: ' . $e->getMessage(),
+                    ], 500);
+                }
+            }
+        }
+
+        // ── Path B: No linked user — fall back to raw mail using client_email ──
+        if (!$notified) {
+            $email = $booking->client_email;
+
+            if (!$email) {
+                return response()->json([
+                    'error' => 'No email address found for this client. Please update the booking with a valid email first.',
+                ], 422);
+            }
+
+            try {
+                $dueDate  = \Carbon\Carbon::parse($payment->due_date)->format('F j, Y');
+                $amount   = number_format((float) $payment->amount, 2);
+                $type     = $payment->payment_type ?? 'Payment';
+                $bookingRef = str_pad($booking->id, 5, '0', STR_PAD_LEFT);
+                $clientName = $booking->client_full_name ?: 'Valued Client';
+
+                Mail::raw(
+                    implode("\n\n", [
+                        "Hello {$clientName},",
+                        "This is a friendly payment reminder from Eloquente Catering.",
+                        "Payment Type : {$type}",
+                        "Amount Due   : ₱{$amount}",
+                        "Due Date     : {$dueDate}",
+                        "Booking Ref  : #{$bookingRef}",
+                        "Please settle your payment on or before the due date to keep your booking active.",
+                        "Thank you,\nEloquente Catering Team",
+                    ]),
+                    function ($message) use ($email, $clientName, $bookingRef) {
+                        $message->to($email, $clientName)
+                                ->subject("Payment Reminder – Booking #{$bookingRef} | Eloquente Catering");
+                    }
+                );
+
+                Log::info('Payment reminder raw mail sent (no user account).', [
+                    'payment_id' => $paymentId,
+                    'email'      => $email,
+                ]);
+
+                $notified = true;
+            } catch (\Throwable $e) {
+                Log::error('Payment reminder raw mail failed.', [
+                    'payment_id' => $paymentId,
+                    'email'      => $booking->client_email,
+                    'error'      => $e->getMessage(),
+                ]);
+
+                return response()->json([
+                    'error' => 'Could not send reminder email: ' . $e->getMessage(),
+                ], 500);
+            }
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Payment reminder sent to the client successfully.',
+        ]);
     }
 
     /**

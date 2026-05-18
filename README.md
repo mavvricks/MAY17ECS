@@ -62,6 +62,12 @@ Every time you start working, follow these steps in a new PowerShell window:
     ```powershell
     composer run dev
     ```
+4.  **Sync PayMongo Webhook (in a separate terminal)**:
+    ```powershell
+    $env:PATH = ".\php;" + $env:PATH
+    php artisan paymongo:webhook-sync
+    ```
+    This automatically starts ngrok (if not already running), detects the public URL, disables old webhooks, creates a new one, and updates your `.env` with the webhook secret. You **no longer need to manually create webhooks in the PayMongo Dashboard**.
 
 > [!IMPORTANT]
 > `composer run dev` starts **4 essential processes**:
@@ -109,6 +115,63 @@ The chat system uses **Laravel Reverb**.
 
 ---
 
+## PayMongo Payments
+
+Payments now use real PayMongo hosted Checkout Sessions instead of the old mock checkout.
+
+Required `.env` values:
+
+```env
+PAYMONGO_BASE_URL=https://api.paymongo.com
+PAYMONGO_CHECKOUT_ENDPOINT=/v1/checkout_sessions
+PAYMONGO_PUBLIC_KEY=pk_test_...
+PAYMONGO_SECRET_KEY=sk_test_...
+PAYMONGO_WEBHOOK_SECRET=...  # Auto-managed by paymongo:webhook-sync
+PAYMONGO_CURRENCY=PHP
+PAYMONGO_PAYMENT_METHOD_TYPES=card,gcash,paymaya
+PAYMONGO_CA_BUNDLE=storage/app/cacert.pem
+PAYMONGO_WEBHOOK_TOLERANCE=300
+NGROK_PATH=C:\Users\YOUR_USER\Downloads\ngrok-v3-stable-windows-amd64\ngrok.exe
+```
+
+After changing these values, run:
+
+```powershell
+php artisan config:clear
+```
+
+### Automatic Webhook Setup (Recommended)
+
+Instead of manually running ngrok and creating webhooks in the PayMongo Dashboard, run:
+
+```powershell
+php artisan paymongo:webhook-sync
+```
+
+This command:
+1. Starts ngrok automatically (or detects a running instance)
+2. Discovers the new public HTTPS URL
+3. Disables any old PayMongo webhooks pointing to previous ngrok URLs
+4. Creates a new webhook for the current ngrok URL
+5. Updates `PAYMONGO_WEBHOOK_SECRET` in your `.env` automatically
+6. Clears the config cache
+
+You no longer need to visit the PayMongo Dashboard to manage webhooks.
+
+### Manual Webhook Setup (Alternative)
+
+If you prefer manual setup, run ngrok:
+
+```powershell
+& "C:\Users\Joshua Aquino\Downloads\ngrok-v3-stable-windows-amd64\ngrok.exe" http 8080
+```
+
+Then use the HTTPS forwarding URL plus `/webhook/paymongo` in the PayMongo Dashboard.
+
+Full testing instructions are in `paymongo-testing.md`.
+
+---
+
 ## 🔑 Default Accounts (Post-Seed)
 
 **Password for all:** `password123`
@@ -124,11 +187,14 @@ The chat system uses **Laravel Reverb**.
 
 ## 📂 Key Files & Directories
 
-*   `app/Http/Controllers/PaymentController.php`: Handles payment flow (Currently simulated - see [darevhandoff.md](file:///darevhandoff.md)).
+*   `app/Http/Controllers/PaymentController.php`: Creates PayMongo Checkout Sessions for the 10/70/20 milestone flow.
+*   `app/Http/Controllers/PayMongoWebhookController.php`: Verifies PayMongo webhook signatures and marks paid milestones.
+*   `app/Services/PayMongoService.php`: PayMongo API client for hosted checkout creation.
 *   `resources/js/Pages/client/MenuGallery.jsx`: Main menu exploration for clients.
 *   `resources/js/Components/client/MenuBuilder.jsx`: Custom package builder.
 *   `app/Services/BusinessRulesService.php`: Core logic for booking availability and pax limits.
-*   `darevhandoff.md`: **Crucial Read** for technical gaps, security risks, and the remaining implementation roadmap.
+*   `mavhandoff.md`: Current PayMongo integration handoff and next-step notes.
+*   `paymongo-testing.md`: Step-by-step PayMongo checkout and webhook testing guide.
 
 ---
 
@@ -148,6 +214,9 @@ The related staff APIs now use `/api/marketing/...` and `/api/accounting/...`.
 *   **"Prepared statement already exists"**: Ensure you are using **Port 6543** and not 5432.
 *   **White Screen on Login**: Run `php artisan config:clear` and `php artisan route:clear`.
 *   **Vite Manifest Missing**: Run `npm run build` once to generate assets if `composer run dev` is not being used.
+*   **PayMongo cURL error 60**: Ensure `storage/app/cacert.pem` exists and `.env` has `PAYMONGO_CA_BUNDLE=storage/app/cacert.pem`, then run `php artisan config:clear`.
+*   **Ngrok not recognized**: Run ngrok by full path from Downloads, or add `ngrok.exe` to your Windows PATH.
+*   **PayMongo webhook returns 401**: Confirm `PAYMONGO_WEBHOOK_SECRET` exactly matches the webhook signing secret in the PayMongo Dashboard, then clear config.
 
 ---
 *Developed for Eloquente Catering System.*
