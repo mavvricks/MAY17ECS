@@ -175,11 +175,19 @@ const DashboardAccounting = () => {
                 headers: { }
             });
 
+            const data = await res.json().catch(() => null);
+
             if (res.ok) {
                 setToast({ message: 'Refund processed successfully!', type: 'success' });
                 fetchRefundQueue();
             } else {
-                setToast({ message: 'Failed to process refund.', type: 'error' });
+                let errorMsg = 'Failed to process refund.';
+                if (data && data.details && data.details.length > 0) {
+                    errorMsg = data.details[0]; // Show the specific PayMongo error
+                } else if (data && data.error) {
+                    errorMsg = data.error;
+                }
+                setToast({ message: errorMsg, type: 'error' });
             }
         } catch (error) {
             console.error("Error processing refund:", error);

@@ -150,6 +150,58 @@ class PayMongoService
         return is_file($path) ? $path : true;
     }
 
+    public function createRefund(string $paymentId, float $amount, string $reason = 'requested_by_customer', string $notes = ''): array
+    {
+        $this->assertConfigured();
+
+        $payload = [
+            'data' => [
+                'attributes' => [
+                    'amount' => $this->toCentavos($amount),
+                    'payment_id' => $paymentId,
+                    'reason' => $reason,
+                    'notes' => $notes,
+                ],
+            ],
+        ];
+
+        try {
+            $response = Http::baseUrl((string) config('services.paymongo.base_url'))
+                ->withBasicAuth((string) config('services.paymongo.secret_key'), '')
+                ->acceptJson()
+                ->asJson()
+                ->withOptions([
+                    'verify' => $this->certificateAuthorityBundle(),
+                ])
+                ->timeout((int) config('services.paymongo.timeout', 20))
+                ->post('/v1/refunds', $payload)
+                ->throw()
+                ->json();
+        } catch (ConnectionException $exception) {
+            report($exception);
+
+            throw new RuntimeException(
+                'Unable to connect securely to PayMongo to process refund. Please verify internet connection.',
+                previous: $exception
+            );
+        } catch (RequestException $exception) {
+            report($exception);
+
+            $message = Arr::get($exception->response?->json() ?? [], 'errors.0.detail')
+                ?? Arr::get($exception->response?->json() ?? [], 'errors.0.code')
+                ?? 'PayMongo rejected the refund request.';
+
+            throw new RuntimeException($message, previous: $exception);
+        }
+
+        return [
+            'id' => Arr::get($response, 'data.id'),
+            'amount' => Arr::get($response, 'data.attributes.amount') / 100,
+            'status' => Arr::get($response, 'data.attributes.status'),
+            'raw' => $response,
+        ];
+    }
+
     private function toCentavos(float $amount): int
     {
         return (int) round($amount * 100);

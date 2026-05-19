@@ -410,7 +410,7 @@ class AccountingController extends Controller
         $items = DB::table('bookings as b')
             ->join('payments as p', 'b.id', '=', 'p.booking_id')
             ->where('b.status', 'Cancelled')
-            ->where('p.status', 'Verified')
+            ->whereIn('p.status', ['Verified', 'Paid'])
             ->select(
                 'b.id as booking_id',
                 'b.client_full_name',
@@ -427,27 +427,83 @@ class AccountingController extends Controller
 
     /**
      * Process refund for a booking.
-     * Ported from: accountingController.processRefund()
+     * Integrates with PayMongo API to refund actual payments.
      */
-    public function processRefund(int $bookingId)
+    public function processRefund(int $bookingId, \App\Services\PayMongoService $payMongo)
     {
         $verifiedBy = Auth::user()->username ?? 'accounting';
 
-        $updated = Payment::where('booking_id', $bookingId)
-            ->where('status', 'Verified')
-            ->update([
-                'status'      => 'Refunded',
-                'verified_by' => $verifiedBy,
-                'verified_at' => now(),
-            ]);
+        $payments = Payment::where('booking_id', $bookingId)
+            ->whereIn('status', ['Verified', 'Paid'])
+            ->get();
 
-        if ($updated === 0) {
-            return response()->json(['error' => 'No verified payments found for this booking to refund.'], 404);
+        if ($payments->isEmpty()) {
+            return response()->json(['error' => 'No verified or paid payments found for this booking to refund.'], 404);
         }
 
-        Log::info("[SIMULATED REFUND] Processed refund for booking #{$bookingId}. Updated {$updated} payment records.");
+        $refundCount = 0;
+        $errors = [];
 
-        return response()->json(['success' => true, 'message' => 'Refund processed successfully.']);
+        foreach ($payments as $payment) {
+            try {
+                // Do not refund the reservation fee (10% non-refundable)
+                if ($payment->payment_type === 'Reservation') {
+                    // Mark as 'Forfeited' or leave it? We'll mark as Refunded so it's removed from queue,
+                    // but we won't process a real refund for it, keeping the money.
+                    $payment->update([
+                        'status'      => 'Refunded',
+                        'verified_by' => $verifiedBy,
+                        'verified_at' => now(),
+                        'payment_method' => $payment->payment_method . ' (Forfeited)'
+                    ]);
+                    continue;
+                }
+
+                // If it was paid via PayMongo and has a payment ID, issue a real refund
+                if ($payment->paymongo_payment_id) {
+                    try {
+                        $payMongo->createRefund(
+                            paymentId: $payment->paymongo_payment_id,
+                            amount: (float) $payment->amount,
+                            reason: 'requested_by_customer',
+                            notes: "Refunded via Accounting Dashboard for Booking #{$bookingId}"
+                        );
+                    } catch (\Exception $apiException) {
+                        Log::error("PayMongo API failed for payment #{$payment->id}: " . $apiException->getMessage());
+                        $errors[] = "Payment #{$payment->id} failed: " . $apiException->getMessage();
+                        continue; // Skip local update if the real refund failed
+                    }
+                }
+
+                // Update the payment record
+                $payment->update([
+                    'status'      => 'Refunded',
+                    'verified_by' => $verifiedBy,
+                    'verified_at' => now(),
+                ]);
+
+                $refundCount++;
+            } catch (\Exception $e) {
+                Log::error("Failed to process refund for payment #{$payment->id}: " . $e->getMessage());
+                $errors[] = "Payment #{$payment->id}: " . $e->getMessage();
+            }
+        }
+
+        if (count($errors) > 0 && $refundCount === 0) {
+            return response()->json([
+                'error' => 'Failed to process refunds.',
+                'details' => $errors
+            ], 500);
+        }
+
+        $message = "Refund processed successfully. Non-refundable reservation fees were forfeited.";
+        if (count($errors) > 0) {
+            $message .= " However, some payments failed to refund.";
+        }
+
+        Log::info("[REFUND] Processed refund for booking #{$bookingId}. Updated records.");
+
+        return response()->json(['success' => true, 'message' => $message]);
     }
 }
 

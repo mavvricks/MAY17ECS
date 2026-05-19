@@ -206,7 +206,7 @@ class PayMongoWebhookSync extends Command
         $command = "\"{$ngrokPath}\" http {$port}";
 
         if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-            pclose(popen("start /B {$command} > NUL 2>&1", 'r'));
+            pclose(popen("start /B \"\" {$command} > NUL 2>&1", 'r'));
         } else {
             exec("{$command} > /dev/null 2>&1 &");
         }
@@ -277,9 +277,8 @@ class PayMongoWebhookSync extends Command
         $envPath = env('NGROK_PATH');
         if ($envPath) {
             $envPath = str_replace(['/', '\\'], DIRECTORY_SEPARATOR, $envPath);
-            if (is_file($envPath)) {
-                return $envPath;
-            }
+            // Bypass is_file() because it returns false for WindowsApp execution aliases
+            return $envPath;
         }
 
         // 3. Common Windows location
