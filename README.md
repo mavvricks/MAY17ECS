@@ -140,6 +140,20 @@ After changing these values, run:
 php artisan config:clear
 ```
 
+### 🤝 For Group Members (Testing Setup)
+
+If you are a group member running this project on your machine, you must do the following to test payments:
+
+1. **Use the Same Keys:** Get the `PAYMONGO_PUBLIC_KEY` and `PAYMONGO_SECRET_KEY` from the project lead and place them in your `.env`. (It is highly recommended that everyone uses the same test account so all test data is in one place).
+2. **Download Ngrok:** 
+   - Download Ngrok from `https://ngrok.com/download`.
+   - Extract `ngrok.exe` to a folder (e.g., `Downloads\ngrok-v3-stable-windows-amd64`).
+   - Update `NGROK_PATH` in your `.env` to point to the exact location of your `ngrok.exe`.
+3. **Run the Sync Command:** Before you start testing payments on your machine, run `php artisan paymongo:webhook-sync` in a new terminal. 
+
+> [!WARNING]
+> **Sharing One Account:** Because you are all using the same PayMongo account, the sync command will automatically disable old webhooks and point the new one to *your* computer. This means **only the last person who ran the sync command will receive payment updates**. If your teammate is currently testing payments, let them finish before you run the sync command on your machine!
+
 ### Automatic Webhook Setup (Recommended)
 
 Instead of manually running ngrok and creating webhooks in the PayMongo Dashboard, run:
