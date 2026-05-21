@@ -4,6 +4,7 @@ namespace App\Services;
 
 use App\Models\Booking;
 use App\Models\BusinessRule;
+use App\Models\Payment;
 use Carbon\Carbon;
 
 class PaymentCalculationService
@@ -90,6 +91,68 @@ class PaymentCalculationService
     }
 
     /**
+     * Bring unpaid payment rows back in line with the current rush/standard schedule.
+     * This fixes older rush bookings that were saved as 70/20 or 20 instead of 80/20 or 100.
+     */
+    public function syncPendingTranches(Booking $booking): void
+    {
+        $tranches = collect($this->calculateTranches($booking));
+
+        if ($tranches->isEmpty() || (float) $booking->total_cost <= 0) {
+            return;
+        }
+
+        $booking->loadMissing('payments');
+        $payments = $booking->payments;
+        $lockedStatuses = ['Paid', 'Verified', 'Refunded'];
+        $pendingStatuses = ['Pending', 'Failed', 'Rejected'];
+        $hasLockedPayments = $payments->contains(fn (Payment $payment) => in_array($payment->status, $lockedStatuses, true));
+
+        // Only remove obsolete rows when nothing has been paid yet. Once money moved, preserve the audit trail.
+        if (!$hasLockedPayments) {
+            $expectedTypes = $tranches->pluck('name')->all();
+            $booking->payments()
+                ->whereNotIn('payment_type', $expectedTypes)
+                ->whereIn('status', $pendingStatuses)
+                ->delete();
+        }
+
+        foreach ($tranches as $tranche) {
+            $payment = $booking->payments()
+                ->where('payment_type', $tranche['name'])
+                ->whereIn('status', $pendingStatuses)
+                ->orderBy('id')
+                ->first();
+
+            if (!$payment) {
+                if ($hasLockedPayments) {
+                    continue;
+                }
+
+                $booking->payments()->create([
+                    'amount' => round((float) $tranche['amount'], 2),
+                    'payment_method' => 'Pending',
+                    'status' => 'Pending',
+                    'payment_type' => $tranche['name'],
+                    'due_date' => Carbon::parse($tranche['due_date'])->toDateString(),
+                ]);
+
+                continue;
+            }
+
+            $expectedAmount = round((float) $tranche['amount'], 2);
+            $currentAmount = round((float) $payment->amount, 2);
+            if ($currentAmount !== $expectedAmount) {
+                $payment->forceFill([
+                    'amount' => $expectedAmount,
+                ])->save();
+            }
+        }
+
+        $booking->unsetRelation('payments');
+    }
+
+    /**
      * Check if the booking is within the non-refundable window (7 days before event).
      * 
      * @param Booking $booking
@@ -113,6 +176,8 @@ class PaymentCalculationService
      */
     public function getNextPaymentDue(Booking $booking): ?array
     {
+        $this->syncPendingTranches($booking);
+
         // Since tranches are generated dynamically at reservation time (Standard, Rush 1, Rush 2)
         // we can simply find the earliest pending payment from the database.
         $nextPayment = $booking->payments()
@@ -141,5 +206,64 @@ class PaymentCalculationService
             'status' => $nextPayment->status,
             'description' => $description,
         ];
+    }
+
+    public function updateBookingMilestone(Booking $booking): void
+    {
+        $booking->load('payments');
+
+        $totalPaid = (float) $booking->payments
+            ->whereIn('status', ['Paid', 'Verified'])
+            ->sum(fn (Payment $payment) => (float) $payment->amount);
+
+        $totalCost = (float) $booking->total_cost;
+        $paidRatio = $totalCost > 0 ? $totalPaid / $totalCost : 0;
+
+        $updates = [
+            'milestone_step' => $this->milestoneStep($paidRatio),
+            'live_status' => $this->bookingLiveStatus($paidRatio),
+        ];
+
+        if ($paidRatio >= 1) {
+            $updates['status'] = 'Completed';
+        } elseif ($paidRatio >= 0.10) {
+            $updates['status'] = 'Reserved';
+        }
+
+        $booking->update($updates);
+    }
+
+    private function milestoneStep(float $paidRatio): int
+    {
+        if ($paidRatio >= 1) {
+            return 5;
+        }
+
+        if ($paidRatio >= 0.80) {
+            return 4;
+        }
+
+        if ($paidRatio >= 0.10) {
+            return 3;
+        }
+
+        return 1;
+    }
+
+    private function bookingLiveStatus(float $paidRatio): string
+    {
+        if ($paidRatio >= 1) {
+            return 'Payment Complete';
+        }
+
+        if ($paidRatio >= 0.80) {
+            return 'Progress Payment Paid';
+        }
+
+        if ($paidRatio >= 0.10) {
+            return 'Reserved';
+        }
+
+        return 'Payment Pending';
     }
 }

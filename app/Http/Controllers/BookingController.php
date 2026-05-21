@@ -6,14 +6,17 @@ use App\Models\Booking;
 use App\Models\MenuItem;
 use App\Models\Payment;
 use App\Models\User;
+use App\Mail\BookingContinuationReminder;
 use App\Notifications\NewBookingNotification;
 use App\Services\BookingValidationService;
 use App\Services\BusinessRulesService;
 use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Notification;
 
 /**
@@ -167,6 +170,61 @@ class BookingController extends Controller
     }
 
     /**
+     * Send a gentle continuation email when a logged-in client leaves a meaningful booking draft.
+     */
+    public function sendAbandonedReminder(Request $request)
+    {
+        $user = Auth::user();
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated'], 401);
+        }
+
+        $data = $request->validate([
+            'step' => 'required|integer|min:2|max:6',
+            'event_date' => 'nullable|date',
+            'event_time' => 'nullable|string|max:20',
+            'event_type' => 'nullable|string|max:120',
+            'pax' => 'nullable|integer|min:1|max:5000',
+            'client_email' => 'nullable|email|max:255',
+            'client_full_name' => 'nullable|string|max:255',
+            'total_cost' => 'nullable|numeric|min:0',
+        ]);
+
+        $email = $data['client_email'] ?? $user->email;
+        if (!$email) {
+            return response()->json(['message' => 'No customer email available.'], 202);
+        }
+
+        $draftSignature = sha1(implode('|', [
+            $user->id,
+            $data['step'],
+            $data['event_date'] ?? '',
+            $data['event_type'] ?? '',
+            $data['pax'] ?? '',
+        ]));
+        $cacheKey = "booking.abandoned_reminder.{$draftSignature}";
+
+        if (Cache::has($cacheKey)) {
+            return response()->json(['message' => 'Reminder already sent for this draft.']);
+        }
+
+        try {
+            Mail::to($email)->send(new BookingContinuationReminder($user, $data));
+            Cache::put($cacheKey, true, now()->addHours(6));
+        } catch (\Throwable $e) {
+            Log::warning('Booking continuation reminder failed.', [
+                'user_id' => $user->id,
+                'email' => $email,
+                'error' => $e->getMessage(),
+            ]);
+
+            return response()->json(['message' => 'Reminder could not be sent right now.'], 202);
+        }
+
+        return response()->json(['message' => 'Continuation reminder sent.']);
+    }
+
+    /**
      * GET /api/bookings/disabled-dates
      *
      * Returns an array of all fully-booked dates (YYYY-MM-DD) within the next
@@ -197,8 +255,8 @@ class BookingController extends Controller
                 \Illuminate\Support\Facades\DB::raw('COUNT(*) as event_count'),
                 \Illuminate\Support\Facades\DB::raw('SUM(pax) as total_pax')
             )
-            ->whereDate('event_date', '>', $today->toDateString())
-            ->whereDate('event_date', '<=', $rangeEnd->toDateString())
+            ->where('event_date', '>', $today->toDateString())
+            ->where('event_date', '<=', $rangeEnd->toDateString())
             ->whereNotIn('status', ['Cancelled', 'cancelled'])
             ->groupBy('booking_date')
             ->get();
@@ -222,11 +280,16 @@ class BookingController extends Controller
     {
         $rules = \App\Models\BusinessRule::getActive();
 
-        $eventCount = Booking::whereDate('event_date', $date)
+        $start = Carbon::parse($date)->toDateString();
+        $end = Carbon::parse($date)->addDay()->toDateString();
+
+        $eventCount = Booking::where('event_date', '>=', $start)
+            ->where('event_date', '<', $end)
             ->whereNotIn('status', ['Cancelled', 'cancelled'])
             ->count();
 
-        $totalPax = Booking::whereDate('event_date', $date)
+        $totalPax = Booking::where('event_date', '>=', $start)
+            ->where('event_date', '<', $end)
             ->whereNotIn('status', ['Cancelled', 'cancelled'])
             ->sum('pax') ?? 0;
 

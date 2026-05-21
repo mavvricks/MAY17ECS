@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Events\PaymentProcessed;
-use App\Models\Booking;
 use App\Models\Payment;
+use App\Services\PaymentCalculationService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\DB;
@@ -19,7 +19,7 @@ class PayMongoWebhookController extends Controller
         'link.payment.paid',
     ];
 
-    public function __invoke(Request $request)
+    public function __invoke(Request $request, PaymentCalculationService $paymentCalculation)
     {
         $payload = $request->getContent();
         $signatureHeader = (string) $request->header('Paymongo-Signature', '');
@@ -49,7 +49,7 @@ class PayMongoWebhookController extends Controller
         }
 
         try {
-            $result = DB::transaction(function () use ($event, $eventType, $eventId) {
+            $result = DB::transaction(function () use ($event, $eventType, $eventId, $paymentCalculation) {
                 $payment = $this->resolvePayment($event, $eventType);
 
                 if (!$payment) {
@@ -92,7 +92,7 @@ class PayMongoWebhookController extends Controller
                 $booking = $payment->booking;
 
                 if ($booking) {
-                    $this->updateBookingMilestone($booking);
+                    $paymentCalculation->updateBookingMilestone($booking);
                 }
 
                 broadcast(new PaymentProcessed($payment->fresh()))->toOthers();
@@ -222,6 +222,7 @@ class PayMongoWebhookController extends Controller
     private function storeProviderReferences(Payment $payment, array $event, string $eventType, string $eventId): void
     {
         $resourceId = Arr::get($event, 'data.attributes.data.id');
+        $providerPaymentId = $this->resourcePaymentId($event);
         $paymentIntentId = Arr::get($event, 'data.attributes.data.attributes.payment_intent_id')
             ?? Arr::get($event, 'data.attributes.data.attributes.payment_intent.id');
         $referenceNumber = $this->resourceReferenceNumber($event);
@@ -230,6 +231,7 @@ class PayMongoWebhookController extends Controller
             'paymongo_event_id' => $eventId ?: $payment->paymongo_event_id,
             'paymongo_reference_number' => $referenceNumber ?: $payment->paymongo_reference_number,
             'paymongo_payment_intent_id' => $paymentIntentId ?: $payment->paymongo_payment_intent_id,
+            'paymongo_payment_id' => $providerPaymentId ?: $payment->paymongo_payment_id,
         ];
 
         if ($eventType === 'checkout_session.payment.paid') {
@@ -241,65 +243,6 @@ class PayMongoWebhookController extends Controller
         }
 
         $payment->forceFill($updates)->save();
-    }
-
-    private function updateBookingMilestone(Booking $booking): void
-    {
-        $booking->load('payments');
-
-        $totalPaid = (float) $booking->payments
-            ->whereIn('status', ['Paid', 'Verified'])
-            ->sum(fn (Payment $payment) => (float) $payment->amount);
-
-        $totalCost = (float) $booking->total_cost;
-        $paidRatio = $totalCost > 0 ? $totalPaid / $totalCost : 0;
-
-        $updates = [
-            'milestone_step' => $this->milestoneStep($paidRatio),
-            'live_status' => $this->bookingLiveStatus($paidRatio),
-        ];
-
-        if ($paidRatio >= 1) {
-            $updates['status'] = 'Completed';
-        } elseif ($paidRatio >= 0.10) {
-            $updates['status'] = 'Reserved';
-        }
-
-        $booking->update($updates);
-    }
-
-    private function milestoneStep(float $paidRatio): int
-    {
-        if ($paidRatio >= 1) {
-            return 5;
-        }
-
-        if ($paidRatio >= 0.80) {
-            return 4;
-        }
-
-        if ($paidRatio >= 0.10) {
-            return 3;
-        }
-
-        return 1;
-    }
-
-    private function bookingLiveStatus(float $paidRatio): string
-    {
-        if ($paidRatio >= 1) {
-            return 'Payment Complete';
-        }
-
-        if ($paidRatio >= 0.80) {
-            return 'Progress Payment Paid';
-        }
-
-        if ($paidRatio >= 0.10) {
-            return 'Reserved';
-        }
-
-        return 'Payment Pending';
     }
 
     private function resourceAmount(array $event): ?int
@@ -326,6 +269,13 @@ class PayMongoWebhookController extends Controller
             ?? Arr::get($event, 'data.attributes.data.attributes.payment_method.type')
             ?? Arr::get($event, 'data.attributes.data.attributes.payments.0.attributes.source.type')
             ?? 'PayMongo';
+    }
+
+    private function resourcePaymentId(array $event): ?string
+    {
+        return Arr::get($event, 'data.attributes.data.attributes.payments.0.id')
+            ?? Arr::get($event, 'data.attributes.data.attributes.payment.id')
+            ?? Arr::get($event, 'data.attributes.data.attributes.payment_id');
     }
 
     private function resourceReferenceNumber(array $event): ?string

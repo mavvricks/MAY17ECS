@@ -3,11 +3,15 @@
 namespace App\Http\Controllers;
 
 use App\Models\Booking;
+use App\Models\AuditLog;
 use App\Models\MenuItem;
+use App\Models\Payment;
 use App\Models\PricingOverride;
 use App\Models\User;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
@@ -172,7 +176,30 @@ class AdminController extends Controller
 
     public function getBookings()
     {
-        $bookings = Booking::with([
+        $bookings = Booking::query()
+            ->select([
+                'id',
+                'user_id',
+                'event_date',
+                'event_time',
+                'pax',
+                'budget',
+                'package_id',
+                'event_type',
+                'client_full_name',
+                'client_email',
+                'client_phone',
+                'venue_address_line',
+                'venue_street',
+                'venue_city',
+                'venue_province',
+                'venue_zip_code',
+                'total_cost',
+                'status',
+                'live_status',
+                'created_at',
+            ])
+            ->with([
                 'user:id,username,email,phone,role',
                 'payments:id,booking_id,amount,status,payment_type,due_date',
             ])
@@ -226,6 +253,7 @@ class AdminController extends Controller
         }
 
         $booking->update(['status' => $request->status]);
+        Cache::forget('admin.analytics.v4');
         $booking->refresh();
 
         try {
@@ -319,6 +347,7 @@ class AdminController extends Controller
             'discount_type'  => $discountType,
             'total_cost'     => $newTotalCost,
         ]);
+        Cache::forget('admin.analytics.v4');
 
         return response()->json([
             'message'        => 'Discount applied successfully',
@@ -332,42 +361,172 @@ class AdminController extends Controller
 
     public function getAnalytics()
     {
-        // Revenue Trends by month
-        $revenueTrends = DB::table('bookings')
-            ->whereIn('status', ['Completed', 'Approved', 'Pending'])
-            ->select(
-                DB::raw("strftime('%Y-%m', event_date) as month"),
-                DB::raw('SUM(total_cost) as revenue')
-            )
-            ->groupBy('month')
-            ->orderBy('month', 'asc')
-            ->get();
+        return response()->json(Cache::remember('admin.analytics.v4', now()->addSeconds(45), function () {
+            $activeStatuses = ['Pending', 'Confirmed', 'Completed', 'Approved'];
+            $settledStatuses = ['Paid', 'Verified'];
+            $now = Carbon::now();
+            $driver = DB::connection()->getDriverName();
+            $monthExpression = $driver === 'pgsql'
+                ? "to_char(event_date, 'YYYY-MM')"
+                : "strftime('%Y-%m', event_date)";
+            $monthNumberExpression = $driver === 'pgsql'
+                ? "extract(month from event_date)"
+                : "strftime('%m', event_date)";
 
-        // Top Sellers by package
-        $topSellers = DB::table('bookings')
-            ->whereNotNull('package_id')
-            ->where('status', '!=', 'Cancelled')
-            ->select('package_id', DB::raw('COUNT(id) as count'))
-            ->groupBy('package_id')
-            ->orderBy('count', 'desc')
-            ->get();
+            $summaryRow = DB::table('bookings')
+                ->whereIn('status', $activeStatuses)
+                ->selectRaw('SUM(COALESCE(total_cost, budget, 0)) as total_revenue')
+                ->selectRaw('SUM(pax) as total_pax')
+                ->selectRaw('COUNT(id) as total_bookings')
+                ->selectRaw("SUM(CASE WHEN status = 'Confirmed' THEN 1 ELSE 0 END) as active_bookings")
+                ->selectRaw("SUM(CASE WHEN status = 'Pending' THEN 1 ELSE 0 END) as pending_bookings")
+                ->first();
 
-        // Peak Seasons heatmap
-        $peakSeasons = DB::table('bookings')
-            ->where('status', '!=', 'Cancelled')
-            ->select(
-                DB::raw("strftime('%m', event_date) as month"),
-                DB::raw('COUNT(id) as count')
-            )
-            ->groupBy('month')
-            ->orderBy('count', 'desc')
-            ->get();
+            $paymentTotals = Payment::query()
+                ->selectRaw("SUM(CASE WHEN status IN ('Paid', 'Verified') THEN amount ELSE 0 END) as settled_revenue")
+                ->selectRaw("SUM(CASE WHEN status NOT IN ('Paid', 'Verified', 'Refunded') THEN amount ELSE 0 END) as pending_revenue")
+                ->first();
 
-        return response()->json([
-            'revenueTrends' => $revenueTrends,
-            'topSellers'    => $topSellers,
-            'peakSeasons'   => $peakSeasons,
-        ]);
+            $totalRevenue = (float) ($summaryRow->total_revenue ?? 0);
+            $totalBookings = (int) ($summaryRow->total_bookings ?? 0);
+
+            $revenueTrends = DB::table('bookings')
+                ->whereIn('status', $activeStatuses)
+                ->selectRaw("$monthExpression as month")
+                ->selectRaw('SUM(COALESCE(total_cost, budget, 0)) as revenue')
+                ->selectRaw('COUNT(id) as bookings')
+                ->selectRaw('SUM(pax) as pax')
+                ->groupBy('month')
+                ->orderBy('month')
+                ->get()
+                ->map(fn ($row) => [
+                    'month' => $row->month,
+                    'label' => Carbon::createFromFormat('Y-m', $row->month)->format('M Y'),
+                    'revenue' => (float) $row->revenue,
+                    'bookings' => (int) $row->bookings,
+                    'pax' => (int) $row->pax,
+                ]);
+
+            $averageRevenue = $revenueTrends->avg('revenue') ?: 0;
+            $revenueForecast = collect(range(0, 5))->map(function ($offset) use ($now, $revenueTrends, $averageRevenue) {
+                $month = $now->copy()->subMonths(2)->addMonths($offset);
+                $monthKey = $month->format('Y-m');
+                $actual = $revenueTrends->firstWhere('month', $monthKey);
+                $seasonLift = in_array((int) $month->format('n'), [5, 6, 11, 12], true) ? 1.18 : 1;
+
+                return [
+                    'month' => $month->format('M'),
+                    'actual' => $actual['revenue'] ?? null,
+                    'forecast' => round(($actual['revenue'] ?? $averageRevenue) * $seasonLift),
+                ];
+            });
+
+            $projectedPaxDemand = Booking::query()
+                ->whereIn('status', ['Pending', 'Confirmed'])
+                ->whereDate('event_date', '>=', $now->toDateString())
+                ->orderBy('event_date')
+                ->limit(10)
+                ->get(['event_date', 'pax', 'client_full_name', 'event_type'])
+                ->map(fn ($booking) => [
+                    'date' => $booking->event_date->format('M j'),
+                    'pax' => (int) $booking->pax,
+                    'client' => $booking->client_full_name,
+                    'eventType' => $booking->event_type,
+                ]);
+
+            $packageNames = \App\Models\Package::pluck('name', 'id');
+            $topPackages = DB::table('bookings')
+                ->whereIn('bookings.status', $activeStatuses)
+                ->whereNotNull('bookings.package_id')
+                ->selectRaw('bookings.package_id as package_id')
+                ->selectRaw('COUNT(bookings.id) as count')
+                ->selectRaw('SUM(COALESCE(bookings.total_cost, bookings.budget, 0)) as revenue')
+                ->groupBy('bookings.package_id')
+                ->orderByDesc('count')
+                ->limit(6)
+                ->get()
+                ->map(fn ($row) => [
+                    'name' => $packageNames[(int) $row->package_id] ?? $row->package_id,
+                    'count' => (int) $row->count,
+                    'revenue' => (float) $row->revenue,
+                ]);
+
+            $menuSales = DB::table('booking_items')
+                ->join('menu_items', 'booking_items.menu_item_id', '=', 'menu_items.id')
+                ->join('bookings', 'booking_items.booking_id', '=', 'bookings.id')
+                ->whereIn('bookings.status', $activeStatuses)
+                ->select('menu_items.name', 'menu_items.category')
+                ->selectRaw('COUNT(booking_items.id) as sales')
+                ->selectRaw('SUM(bookings.pax) as pax_served')
+                ->groupBy('menu_items.name', 'menu_items.category')
+                ->orderByDesc('sales')
+                ->get();
+
+            $salesFrequency = ['All' => $menuSales->take(10)->values()];
+            foreach (['starter', 'main', 'side', 'dessert', 'drink'] as $category) {
+                $salesFrequency[$category] = $menuSales
+                    ->where('category', $category)
+                    ->take(8)
+                    ->values();
+            }
+
+            $peakRows = DB::table('bookings')
+                ->whereIn('status', $activeStatuses)
+                ->selectRaw("$monthNumberExpression as month")
+                ->selectRaw('COUNT(id) as count')
+                ->selectRaw('SUM(pax) as pax')
+                ->groupBy('month')
+                ->get()
+                ->keyBy(fn ($row) => (int) $row->month);
+            $peakSeasons = collect(range(1, 12))->map(function ($month) use ($peakRows) {
+                $row = $peakRows->get($month);
+                return [
+                    'month' => Carbon::createFromDate((int) now()->format('Y'), $month, 1)->format('M'),
+                    'monthNumber' => $month,
+                    'count' => (int) ($row->count ?? 0),
+                    'pax' => (int) ($row->pax ?? 0),
+                ];
+            });
+
+            return [
+                'summary' => [
+                    'totalRevenue' => $totalRevenue,
+                    'settledRevenue' => (float) ($paymentTotals->settled_revenue ?? 0),
+                    'pendingRevenue' => (float) ($paymentTotals->pending_revenue ?? 0),
+                    'activeBookings' => (int) ($summaryRow->active_bookings ?? 0),
+                    'pendingBookings' => (int) ($summaryRow->pending_bookings ?? 0),
+                    'totalBookings' => $totalBookings,
+                    'totalPax' => (int) ($summaryRow->total_pax ?? 0),
+                    'averageBookingValue' => $totalBookings > 0 ? round($totalRevenue / $totalBookings, 2) : 0,
+                ],
+                'revenueTrends' => $revenueTrends,
+                'revenueForecast' => $revenueForecast,
+                'projectedPaxDemand' => $projectedPaxDemand,
+                'salesFrequency' => $salesFrequency,
+                'topSellers' => $topPackages,
+                'peakSeasons' => $peakSeasons,
+            ];
+        }));
+    }
+
+    public function getAudits(Request $request)
+    {
+        $perPage = min((int) $request->query('per_page', 25), 100);
+
+        $query = AuditLog::query()
+            ->when($request->query('role'), fn ($q, $role) => $q->where('role', $role))
+            ->when($request->query('method'), fn ($q, $method) => $q->where('method', strtoupper($method)))
+            ->when($request->query('search'), function ($q, $search) {
+                $term = '%' . trim($search) . '%';
+                $q->where(function ($inner) use ($term) {
+                    $inner->where('username', 'like', $term)
+                        ->orWhere('action', 'like', $term)
+                        ->orWhere('path', 'like', $term);
+                });
+            })
+            ->orderByDesc('created_at');
+
+        return response()->json($query->paginate($perPage));
     }
 
     // ==========================================
@@ -404,6 +563,7 @@ class AdminController extends Controller
             'description'    => $request->description ?? '',
             'is_best_seller' => $request->is_best_seller ?? false,
         ]);
+        Cache::forget('admin.analytics.v4');
 
         return response()->json($item, 201);
     }
@@ -429,6 +589,7 @@ class AdminController extends Controller
             'name', 'category', 'cost_per_head', 'price_adj',
             'image', 'description', 'is_best_seller',
         ]));
+        Cache::forget('admin.analytics.v4');
 
         return response()->json($item);
     }
@@ -441,6 +602,7 @@ class AdminController extends Controller
         }
 
         $item->delete();
+        Cache::forget('admin.analytics.v4');
         return response()->json(['message' => 'Menu item deleted successfully']);
     }
 }

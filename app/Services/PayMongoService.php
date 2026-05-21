@@ -110,6 +110,41 @@ class PayMongoService
         }
     }
 
+    public function retrieveCheckoutSession(string $checkoutSessionId): array
+    {
+        $this->assertConfigured();
+
+        try {
+            $response = Http::baseUrl((string) config('services.paymongo.base_url'))
+                ->withBasicAuth((string) config('services.paymongo.secret_key'), '')
+                ->acceptJson()
+                ->withOptions([
+                    'verify' => $this->certificateAuthorityBundle(),
+                ])
+                ->timeout((int) config('services.paymongo.timeout', 20))
+                ->get("/v1/checkout_sessions/{$checkoutSessionId}")
+                ->throw()
+                ->json();
+        } catch (ConnectionException $exception) {
+            report($exception);
+
+            throw new RuntimeException(
+                'Unable to connect securely to PayMongo to confirm checkout status.',
+                previous: $exception
+            );
+        } catch (RequestException $exception) {
+            report($exception);
+
+            $message = Arr::get($exception->response?->json() ?? [], 'errors.0.detail')
+                ?? Arr::get($exception->response?->json() ?? [], 'errors.0.code')
+                ?? 'PayMongo rejected the checkout status request.';
+
+            throw new RuntimeException($message, previous: $exception);
+        }
+
+        return $response ?? [];
+    }
+
     private function billingDetails(Booking $booking): array
     {
         return array_filter([

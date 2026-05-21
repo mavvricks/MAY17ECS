@@ -1,10 +1,23 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
 import { router } from '@inertiajs/react';
 import StaffMessaging from '../Components/common/StaffMessaging';
 import NotificationBell from '../Components/common/NotificationBell';
 import FlashToast from '../Components/common/FlashToast';
+import useSmartRefresh from '../hooks/useSmartRefresh';
+import {
+    formatDate,
+    formatFullAddress,
+    formatMoney,
+    formatTime,
+    getBookingValue,
+    getDateKey,
+    getDaysInMonth,
+    getFirstDayOfMonth,
+    getSelectedDishes,
+    titleCase,
+} from '../utils/dashboardUtils';
 
 const DashboardMarketing = () => {
     const { user, logout } = useAuth();
@@ -12,7 +25,6 @@ const DashboardMarketing = () => {
     const [bookings, setBookings] = useState([]);
     const [loading, setLoading] = useState(true);
     const [activeTab, setActiveTab] = useState('calendar');
-    const [inquiryViewMode, setInquiryViewMode] = useState('list');
     const [selectedMonth, setSelectedMonth] = useState(new Date());
     const [menuItems, setMenuItems] = useState([]);
     const [packages, setPackages] = useState([]);
@@ -49,7 +61,20 @@ const DashboardMarketing = () => {
         }
     }, [activeTab]);
 
-    const fetchBookings = async () => {
+    useSmartRefresh({
+        enabled: true,
+        interval: activeTab === 'settings' ? 120000 : 90000,
+        idleAfter: 180000,
+        refresh: ({ silent = false } = {}) => {
+            if (activeTab === 'settings') {
+                fetchMarketingSettings();
+            } else {
+                fetchBookings({ silent });
+            }
+        },
+    });
+
+    const fetchBookings = async ({ silent = false } = {}) => {
         try {
             // Session auth - no token needed
             const response = await fetch('/api/marketing/bookings', {
@@ -64,7 +89,7 @@ const DashboardMarketing = () => {
         } catch (error) {
             console.error("Error fetching bookings:", error);
         } finally {
-            setLoading(false);
+            if (!silent) setLoading(false);
         }
     };
 
@@ -238,56 +263,70 @@ const DashboardMarketing = () => {
         }
     };
 
-    // Calendar Helper Functions
-    const getDaysInMonth = (date) => {
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        return new Date(year, month + 1, 0).getDate();
+    const getCalendarEventLabel = (booking) => {
+        const time = formatTime(booking.event_time);
+        const eventType = titleCase(booking.event_type || booking.package_type || booking.type) || 'Event';
+        const client = booking.client_full_name || booking.username || 'Unnamed client';
+        return `${time} • ${eventType} • ${client}`;
     };
 
-    const getFirstDayOfMonth = (date) => {
-        const year = date.getFullYear();
-        const month = date.getMonth();
-        return new Date(year, month, 1).getDay();
+    const getCompactClientName = (booking) => {
+        const name = booking.client_full_name || booking.username || 'Client';
+        const parts = String(name).trim().split(/\s+/);
+        return parts.length > 1 ? parts[parts.length - 1] : name;
     };
 
-    const formatFullAddress = (booking) => {
+    const getCalendarEventPrimary = (booking) => (
+        titleCase(booking.event_type || booking.package_type || booking.type) || `Booking #${booking.id}`
+    );
+
+    const getCalendarEventSecondary = (booking) => {
+        const pax = booking.pax ? ` · ${booking.pax} pax` : '';
+        return `${formatTime(booking.event_time)} · ${getCompactClientName(booking)}${pax}`;
+    };
+
+    const getCalendarEventTitle = (booking) => {
         const parts = [
-            booking.venue_address_line,
-            booking.venue_street,
-            booking.venue_city,
-            booking.venue_province,
-            booking.venue_zip_code
+            `Booking #${booking.id}`,
+            getCalendarEventLabel(booking),
+            booking.pax ? `${booking.pax} pax` : null,
+            booking.status ? `Status: ${booking.status}` : null,
         ].filter(Boolean);
-        return parts.length > 0 ? parts.join(', ') : 'Not specified';
-    };
-
-    const formatMoney = (value) => Number(value || 0).toLocaleString(undefined, {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-    });
-
-    const getSelectedDishes = (booking) => {
-        if (!booking?.selected_menu) return [];
-        try {
-            const menu = typeof booking.selected_menu === 'string'
-                ? JSON.parse(booking.selected_menu)
-                : booking.selected_menu;
-
-            return Object.entries(menu || {}).flatMap(([category, items]) => {
-                if (!Array.isArray(items)) return [];
-                return items.map((item) => ({
-                    category,
-                    name: typeof item === 'object' && item !== null ? (item.name || item.label || item.id) : item,
-                })).filter((item) => item.name);
-            });
-        } catch (error) {
-            console.error('Unable to parse selected menu', error);
-            return [];
-        }
+        return parts.join('\n');
     };
 
     const [selectedBooking, setSelectedBooking] = useState(null);
+
+    const dashboardSummary = useMemo(() => {
+        const now = new Date();
+        now.setHours(0, 0, 0, 0);
+        const monthKey = `${selectedMonth.getFullYear()}-${String(selectedMonth.getMonth() + 1).padStart(2, '0')}`;
+        const pending = bookings.filter(b => b.status === 'Pending');
+        const confirmed = bookings.filter(b => b.status === 'Confirmed');
+        const monthEvents = bookings.filter(b => b.event_date?.substring(0, 7) === monthKey);
+        const upcoming = bookings.filter(b => {
+            if (!b.event_date || !['Pending', 'Confirmed'].includes(b.status)) return false;
+            const eventDate = new Date(b.event_date);
+            eventDate.setHours(0, 0, 0, 0);
+            return eventDate >= now;
+        });
+
+        return {
+            pending: pending.length,
+            confirmed: confirmed.length,
+            monthEvents: monthEvents.length,
+            upcoming: upcoming.length,
+            pipeline: pending.reduce((sum, booking) => sum + getBookingValue(booking), 0),
+        };
+    }, [bookings, selectedMonth]);
+
+    const tabMeta = {
+        calendar: 'Calendar',
+        inquiries: 'Inquiries',
+        documents: 'Documents',
+        settings: 'Catalog',
+        messages: 'Messages',
+    };
 
     const renderCalendar = () => {
         const daysInMonth = getDaysInMonth(selectedMonth);
@@ -295,7 +334,7 @@ const DashboardMarketing = () => {
         const days = [];
 
         for (let i = 0; i < firstDay; i++) {
-            days.push(<div key={`empty-${i}`} className="h-32 bg-gray-50 border border-gray-100"></div>);
+            days.push(<div key={`empty-${i}`} className="marketing-calendar-cell marketing-calendar-cell-empty"></div>);
         }
 
         for (let day = 1; day <= daysInMonth; day++) {
@@ -303,20 +342,23 @@ const DashboardMarketing = () => {
             const dayBookings = bookings.filter(b => b.event_date && b.event_date.substring(0, 10) === dateStr);
 
             days.push(
-                <div key={day} className="h-32 bg-white border border-gray-100 p-2 overflow-y-auto hover:bg-gray-50 transition-colors">
-                    <div className="font-bold text-gray-700 mb-1">{day}</div>
+                <div key={day} className="marketing-calendar-cell custom-scrollbar">
+                    <div className="mb-2 flex items-center justify-between">
+                        <span className="text-xs font-black text-slate-700">{day}</span>
+                        {dayBookings.length > 0 && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-black text-amber-800">{dayBookings.length}</span>}
+                    </div>
                     {dayBookings.map(booking => (
                         <div
                             key={booking.id}
-                            className={`text-xs p-1 mb-1 rounded cursor-pointer truncate ${booking.status === 'Confirmed' ? 'bg-green-100 text-green-800' :
-                                booking.status === 'Pending' ? 'bg-yellow-100 text-yellow-800' :
-                                    'bg-gray-100 text-gray-800'
+                            className={`marketing-event-chip mb-1 cursor-pointer rounded-lg px-2 py-1 text-[11px] font-bold transition-transform hover:-translate-y-0.5 ${booking.status === 'Confirmed' ? 'bg-emerald-100 text-emerald-800' :
+                                booking.status === 'Pending' ? 'bg-amber-100 text-amber-800' :
+                                    'bg-slate-100 text-slate-700'
                                 }`}
+                            title={getCalendarEventTitle(booking)}
                             onClick={() => setSelectedBooking(booking)}
                         >
-                            {booking.event_time && booking.event_time.length > 18
-                                ? booking.event_time.substring(0, 18) + '...'
-                                : booking.event_time}
+                            <span className="marketing-event-primary">{getCalendarEventPrimary(booking)}</span>
+                            <span className="marketing-event-secondary">{getCalendarEventSecondary(booking)}</span>
                         </div>
                     ))}
                 </div>
@@ -334,21 +376,21 @@ const DashboardMarketing = () => {
         return (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={() => setSelectedBooking(null)}>
                 <div className="absolute inset-0 bg-gray-900/60 backdrop-blur-sm"></div>
-                <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-2xl animate-fadeIn overflow-hidden flex flex-col max-h-[90vh]" onClick={e => e.stopPropagation()}>
-                    <div className="px-6 py-4 border-b border-gray-100 bg-gray-50 flex justify-between items-center sticky top-0 z-10">
+                <div className="relative flex max-h-[90vh] w-full max-w-2xl animate-fadeIn flex-col overflow-hidden rounded-2xl bg-white shadow-2xl" onClick={e => e.stopPropagation()}>
+                    <div className="sticky top-0 z-10 flex items-center justify-between border-b border-amber-100 bg-[#fffaf3] px-6 py-4">
                         <div>
-                            <h3 className="text-lg font-bold text-gray-900">Event Intelligence Dashboard</h3>
-                            <p className="text-xs text-gray-500 mt-1">Reference: #BK-{selectedBooking.id.toString().padStart(4, '0')}</p>
+                            <h3 className="text-lg font-bold text-slate-950">Event Brief</h3>
+                            <p className="mt-1 text-xs font-bold text-slate-500">Reference: #BK-{selectedBooking.id.toString().padStart(4, '0')}</p>
                         </div>
                         <button onClick={() => setSelectedBooking(null)} className="text-gray-400 hover:text-gray-600 transition-colors">
                             <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
                         </button>
                     </div>
 
-                    <div className="p-6 overflow-y-auto custom-scrollbar flex-1 space-y-8 bg-white">
+                    <div className="custom-scrollbar flex-1 space-y-8 overflow-y-auto bg-white p-6">
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                            <div className="bg-indigo-50/50 p-4 rounded-xl border border-indigo-100/50">
-                                <h4 className="text-xs font-bold text-indigo-800 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <div className="rounded-xl border border-amber-100 bg-amber-50/60 p-4">
+                                <h4 className="mb-4 flex items-center gap-2 text-xs font-black uppercase tracking-wider text-amber-900">
                                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
                                     Client Logic
                                 </h4>
@@ -368,19 +410,19 @@ const DashboardMarketing = () => {
                                 </div>
                             </div>
 
-                            <div className="bg-blue-50/50 p-4 rounded-xl border border-blue-100/50">
-                                <h4 className="text-xs font-bold text-blue-800 uppercase tracking-wider mb-4 flex items-center gap-2">
+                            <div className="rounded-xl border border-emerald-100 bg-emerald-50/60 p-4">
+                                <h4 className="mb-4 flex items-center gap-2 text-xs font-black uppercase tracking-wider text-emerald-900">
                                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
                                     Temporal Constraints
                                 </h4>
                                 <div className="space-y-3">
                                     <div>
                                         <p className="text-[10px] uppercase font-bold text-gray-400 tracking-wider">Execution Date</p>
-                                        <p className="text-sm font-semibold text-gray-900">{selectedBooking.event_date}</p>
+                                        <p className="text-sm font-semibold text-gray-900">{formatDate(selectedBooking.event_date)}</p>
                                     </div>
                                     <div>
                                         <p className="text-[10px] uppercase font-bold text-gray-400 tracking-wider">Start Time</p>
-                                        <p className="text-sm text-gray-700">{selectedBooking.event_time || 'N/A'}</p>
+                                        <p className="text-sm text-gray-700">{formatTime(selectedBooking.event_time)}</p>
                                     </div>
                                     <div>
                                         <p className="text-[10px] uppercase font-bold text-gray-400 tracking-wider">Status Payload</p>
@@ -394,7 +436,7 @@ const DashboardMarketing = () => {
 
                         <div>
                             <h4 className="text-xs font-bold text-gray-800 uppercase tracking-wider mb-3 border-b border-gray-100 pb-2">Event Venue</h4>
-                            <div className="bg-rose-50/50 rounded-lg p-4 border border-rose-100">
+                            <div className="rounded-lg border border-rose-100 bg-rose-50/60 p-4">
                                 <p className="text-xs text-gray-500 font-medium">Venue Address</p>
                                 <p className="mt-1 text-sm font-bold text-gray-900">{formatFullAddress(selectedBooking)}</p>
                                 {selectedBooking.venue_building_details && (
@@ -465,9 +507,9 @@ const DashboardMarketing = () => {
                         )}
                     </div>
 
-                    <div className="px-6 py-4 border-t border-gray-100 bg-gray-50 flex justify-end">
-                        <button onClick={() => setSelectedBooking(null)} className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-bold rounded-lg shadow-sm transition-colors">
-                            Acknowledge
+                    <div className="flex justify-end border-t border-amber-100 bg-[#fffaf3] px-6 py-4">
+                        <button onClick={() => setSelectedBooking(null)} className="marketing-primary-btn px-6 py-2 text-sm">
+                            Done
                         </button>
                     </div>
                 </div>
@@ -497,13 +539,17 @@ const DashboardMarketing = () => {
             return;
         }
 
-        const filteredBookings = bookings.filter(b => b.event_date >= start && b.event_date <= end);
+        const filteredBookings = bookings.filter(b => {
+            const dateKey = getDateKey(b.event_date);
+            return dateKey >= start && dateKey <= end;
+        });
 
         // Group bookings by date
         const grouped = {};
         filteredBookings.forEach(b => {
-            if (!grouped[b.event_date]) grouped[b.event_date] = [];
-            grouped[b.event_date].push(b);
+            const dateKey = getDateKey(b.event_date);
+            if (!grouped[dateKey]) grouped[dateKey] = [];
+            grouped[dateKey].push(b);
         });
 
         const sortedDates = Object.keys(grouped).sort();
@@ -545,7 +591,7 @@ const DashboardMarketing = () => {
                         const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(dayCount).padStart(2, '0')}`;
                         const dayEvents = grouped[dateStr] || [];
                         const eventsHTML = dayEvents.map(ev =>
-                            `<div class="event ${ev.status === 'Confirmed' ? 'confirmed' : ev.status === 'Pending' ? 'pending' : 'other'}">${ev.client_full_name || ev.username} (${ev.pax}px)</div>`
+                            `<div class="event ${ev.status === 'Confirmed' ? 'confirmed' : ev.status === 'Pending' ? 'pending' : 'other'}">${ev.client_full_name || ev.username} (${ev.pax} pax)</div>`
                         ).join('');
                         calendarHTML += `<td><div class="day-num">${dayCount}</div>${eventsHTML}</td>`;
                         dayCount++;
@@ -577,10 +623,10 @@ const DashboardMarketing = () => {
                             </tr>
                         </thead>
                         <tbody>
-                            ${filteredBookings.sort((a, b) => a.event_date.localeCompare(b.event_date)).map(b => `
+                            ${filteredBookings.sort((a, b) => getDateKey(a.event_date).localeCompare(getDateKey(b.event_date))).map(b => `
                                 <tr>
-                                    <td>${b.event_date}</td>
-                                    <td>${b.event_time || ''}</td>
+                                    <td>${formatDate(b.event_date)}</td>
+                                    <td>${formatTime(b.event_time)}</td>
                                     <td>${b.client_full_name || b.username}</td>
                                     <td>${b.pax}</td>
                                     <td class="small-text">${[b.venue_address_line, b.venue_street, b.venue_city, b.venue_province].filter(Boolean).join(', ') || '-'}</td>
@@ -754,29 +800,20 @@ const DashboardMarketing = () => {
         const pendingBookings = bookings.filter(b => b.status === 'Pending');
         return (
             <div className="space-y-4">
-                <div className="flex justify-end mb-4">
-                    <div className="bg-gray-100 p-1 rounded-lg inline-flex">
-                        <button onClick={() => setInquiryViewMode('list')} className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${inquiryViewMode === 'list' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
-                            <div className="flex items-center gap-1">
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
-                                List
-                            </div>
-                        </button>
-                        <button onClick={() => setInquiryViewMode('card')} className={`px-4 py-1.5 text-sm font-medium rounded-md transition-colors ${inquiryViewMode === 'card' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
-                            <div className="flex items-center gap-1">
-                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2V6zM4 16a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2H6a2 2 0 01-2-2v-2zm10 0a2 2 0 012-2h2a2 2 0 012 2v2a2 2 0 01-2 2h-2a2 2 0 01-2-2v-2z" /></svg>
-                                Cards
-                            </div>
-                        </button>
+                <div className="marketing-panel flex flex-col gap-2 p-5 sm:flex-row sm:items-end sm:justify-between">
+                    <div>
+                        <p className="marketing-kicker">Lead Queue</p>
+                        <h2 className="mt-1 text-xl font-bold text-slate-950">{pendingBookings.length} pending inquiries</h2>
                     </div>
+                    <p className="text-sm font-semibold text-slate-500">Newest client requests that need a decision.</p>
                 </div>
 
-                {inquiryViewMode === 'list' ? (
-                    <div className="bg-white shadow overflow-hidden rounded-xl border border-gray-200">
-                        <ul className="divide-y divide-gray-200">
+                {(
+                    <div className="marketing-panel overflow-hidden">
+                        <ul className="divide-y divide-amber-100/70">
                             {pendingBookings.length === 0 ? <li className="p-8 text-gray-500 text-center">No pending inquiries.</li> : null}
                             {pendingBookings.map(booking => (
-                                <li key={booking.id} onClick={() => setSelectedBooking(booking)} className="block hover:bg-gray-50 transition-colors cursor-pointer">
+                                <li key={booking.id} onClick={() => setSelectedBooking(booking)} className="block cursor-pointer transition-colors hover:bg-[#fffaf3]">
                                     <div className="px-6 py-5">
                                         <div className="flex items-center justify-between">
                                             <p className="text-sm font-bold text-primary-700 truncate">
@@ -792,7 +829,7 @@ const DashboardMarketing = () => {
                                             <div className="sm:flex gap-6">
                                                 <p className="flex items-center text-sm text-gray-600">
                                                     <svg className="w-4 h-4 mr-1.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-                                                    {booking.event_date}
+                                                    {formatDate(booking.event_date)}
                                                 </p>
                                                 <p className="flex items-center text-sm text-gray-600">
                                                     <svg className="w-4 h-4 mr-1.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -800,14 +837,14 @@ const DashboardMarketing = () => {
                                                 </p>
                                                 <p className="flex items-center text-sm text-gray-600">
                                                     <svg className="w-4 h-4 mr-1.5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                                                    ₱{booking.budget?.toLocaleString() || 'N/A'}
+                                                    PHP {formatMoney(booking.budget)}
                                                 </p>
                                             </div>
                                             <div className="mt-4 flex items-center text-sm sm:mt-0 space-x-3">
                                                 <button
                                                     onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Confirmed'); }}
                                                     disabled={!!updatingBookingIds[booking.id]}
-                                                    className={`inline-flex items-center gap-1.5 bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 font-medium px-4 py-1.5 rounded-lg transition-colors${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
+                                                    className={`inline-flex items-center gap-1.5 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-1.5 font-bold text-emerald-700 transition-colors hover:bg-emerald-100${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
                                                 >
                                                     {updatingBookingIds[booking.id] === 'Confirmed' ? (
                                                         <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
@@ -819,7 +856,7 @@ const DashboardMarketing = () => {
                                                 <button
                                                     onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Cancelled'); }}
                                                     disabled={!!updatingBookingIds[booking.id]}
-                                                    className={`inline-flex items-center gap-1.5 bg-red-50 text-red-700 border border-red-200 hover:bg-red-100 font-medium px-4 py-1.5 rounded-lg transition-colors${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
+                                                    className={`inline-flex items-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50 px-4 py-1.5 font-bold text-rose-700 transition-colors hover:bg-rose-100${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
                                                 >
                                                     {updatingBookingIds[booking.id] === 'Cancelled' ? (
                                                         <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
@@ -834,54 +871,6 @@ const DashboardMarketing = () => {
                                 </li>
                             ))}
                         </ul>
-                    </div>
-                ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {pendingBookings.length === 0 ? <div className="col-span-full p-8 text-gray-500 text-center bg-white rounded-xl shadow-sm border border-gray-200">No pending inquiries.</div> : null}
-                        {pendingBookings.map(booking => (
-                            <div key={booking.id} onClick={() => setSelectedBooking(booking)} className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden hover:shadow-md transition-all duration-200 cursor-pointer">
-                                <div className="p-6">
-                                    <div className="flex justify-between items-start mb-4">
-                                        <div className="flex-1 pr-4">
-                                            <span className="text-xs font-bold text-primary-600 uppercase tracking-wide">Booking #{booking.id}</span>
-                                            <h3 className="text-lg font-bold text-gray-900 mt-1 leading-tight">{booking.client_full_name || booking.username}</h3>
-                                        </div>
-                                        <span className="px-2.5 py-1 text-xs font-bold rounded-full bg-yellow-100 text-yellow-800 border border-yellow-200">{booking.status}</span>
-                                    </div>
-                                    <div className="space-y-3 mb-6 bg-gray-50 p-4 rounded-lg">
-                                        <p className="flex justify-between text-sm"><span className="text-gray-500 font-medium">Event Date</span><span className="font-bold text-gray-900">{booking.event_date}</span></p>
-                                        <p className="flex justify-between text-sm"><span className="text-gray-500 font-medium">Guests</span><span className="font-bold text-gray-900">{booking.pax} pax</span></p>
-                                        <p className="flex justify-between text-sm"><span className="text-gray-500 font-medium">Budget</span><span className="font-bold text-primary-700">₱{booking.budget?.toLocaleString() || 'N/A'}</span></p>
-                                    </div>
-                                    <div className="flex gap-3">
-                                        <button
-                                            onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Confirmed'); }}
-                                            disabled={!!updatingBookingIds[booking.id]}
-                                            className={`flex-1 inline-flex items-center justify-center gap-2 bg-green-50 text-green-700 hover:bg-green-100 font-bold py-2.5 rounded-lg text-sm transition-colors border border-green-200 shadow-sm${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
-                                        >
-                                            {updatingBookingIds[booking.id] === 'Confirmed' ? (
-                                                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
-                                            ) : (
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
-                                            )}
-                                            Approve
-                                        </button>
-                                        <button
-                                            onClick={(e) => { e.stopPropagation(); updateStatus(booking.id, 'Cancelled'); }}
-                                            disabled={!!updatingBookingIds[booking.id]}
-                                            className={`flex-1 inline-flex items-center justify-center gap-2 bg-red-50 text-red-700 hover:bg-red-100 font-bold py-2.5 rounded-lg text-sm transition-colors border border-red-200 shadow-sm${updatingBookingIds[booking.id] ? ' opacity-60 cursor-not-allowed' : ''}`}
-                                        >
-                                            {updatingBookingIds[booking.id] === 'Cancelled' ? (
-                                                <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/></svg>
-                                            ) : (
-                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                                            )}
-                                            Reject
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        ))}
                     </div>
                 )}
             </div>
@@ -980,30 +969,34 @@ const DashboardMarketing = () => {
     const renderDocuments = () => {
         const confirmedBookings = bookings.filter(b => b.status === 'Confirmed');
         return (
-            <div className="bg-white shadow overflow-hidden sm:rounded-md">
-                <ul className="divide-y divide-gray-200">
+            <div className="marketing-panel overflow-hidden">
+                <div className="border-b border-amber-100/80 bg-[#fffaf3] px-6 py-5">
+                    <p className="marketing-kicker">Production Docs</p>
+                    <h2 className="mt-1 text-xl font-bold text-slate-950">{confirmedBookings.length} confirmed events ready for paperwork</h2>
+                </div>
+                <ul className="divide-y divide-amber-100/70">
                     {confirmedBookings.length === 0 ? <li className="p-6 text-gray-500 text-center">No confirmed events for documentation.</li> : null}
                     {confirmedBookings.map(booking => (
-                        <li key={booking.id} className="block hover:bg-gray-50">
-                            <div className="px-4 py-4 sm:px-6 flex items-center justify-between">
+                        <li key={booking.id} className="block hover:bg-[#fffaf3]">
+                            <div className="flex flex-col gap-4 px-4 py-4 sm:px-6 lg:flex-row lg:items-center lg:justify-between">
                                 <div>
-                                    <h3 className="text-lg font-medium text-gray-900">
+                                    <h3 className="text-lg font-bold text-gray-900">
                                         Booking #{booking.id} - {booking.client_full_name || booking.username}
                                     </h3>
-                                    <p className="text-sm text-gray-500">
-                                        {booking.event_date} at {booking.event_time}
+                                    <p className="mt-1 text-sm font-medium text-gray-500">
+                                        {formatDate(booking.event_date)} at {formatTime(booking.event_time)}
                                     </p>
                                 </div>
-                                <div className="space-x-3">
+                                <div className="flex flex-wrap gap-3">
                                     <button
                                         onClick={() => generatePDF(booking, 'Contract')}
-                                        className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm"
+                                        className="rounded-lg bg-slate-900 px-4 py-2 text-sm font-bold text-white hover:bg-slate-800"
                                     >
                                         Generate Contract
                                     </button>
                                     <button
                                         onClick={() => generatePDF(booking, 'Kitchen Prep List')}
-                                        className="bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded text-sm"
+                                        className="rounded-lg bg-amber-600 px-4 py-2 text-sm font-bold text-white hover:bg-amber-700"
                                     >
                                         Generate Prep List
                                     </button>
@@ -1022,8 +1015,10 @@ const DashboardMarketing = () => {
 
         return (
             <>
-            <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm">
-                <div className="border-b border-gray-100 bg-gray-50 px-6 pt-5">
+            <div className="marketing-panel overflow-hidden">
+                <div className="border-b border-amber-100/80 bg-[#fffaf3] px-6 pt-5">
+                    <p className="marketing-kicker">Client-Facing Catalog</p>
+                    <h2 className="mt-1 text-xl font-bold text-slate-950">Packages, event types, and dish pricing</h2>
                     <nav className="flex gap-2 overflow-x-auto">
                         {[
                             ['packages', 'Packages'],
@@ -1169,7 +1164,7 @@ const DashboardMarketing = () => {
                 )}
             </div>
 
-            <div className="hidden">
+            {false && <>
                 <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
                     <div className="px-6 py-4 border-b border-gray-100 bg-gray-50">
                         <h3 className="text-sm font-bold text-gray-700 uppercase tracking-wide">Preset Packages by Event Type</h3>
@@ -1255,83 +1250,106 @@ const DashboardMarketing = () => {
                         ))}
                     </div>
                 </div>
-            </div>
+            </>}
             </>
         );
     };
 
-    if (loading) return <div>Loading...</div>;
+    if (loading) return (
+        <div className="marketing-page flex min-h-screen items-center justify-center p-6">
+            <div className="marketing-panel w-full max-w-md p-8 text-center">
+                <div className="mx-auto mb-5 h-12 w-12 animate-spin rounded-full border-4 border-amber-100 border-t-primary-700"></div>
+                <p className="marketing-kicker">Marketing Workspace</p>
+                <h1 className="mt-2 text-2xl font-bold text-slate-950">Loading campaign operations</h1>
+                <p className="mt-2 text-sm font-medium text-slate-500">Pulling event schedules, lead queues, and catalog controls.</p>
+            </div>
+        </div>
+    );
 
     return (
-        <div className="min-h-screen bg-gray-50">
-            <nav className="bg-white shadow-sm border-b border-gray-200">
-                <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-                    <div className="flex justify-between h-16">
-                        <div className="flex items-center">
-                            <h1 className="text-xl font-bold font-display text-primary-600">Eloquente Marketing</h1>
+        <div className="marketing-page min-h-screen">
+            <nav className="marketing-topbar sticky top-0 z-30">
+                <div className="mx-auto max-w-[1500px] px-4 sm:px-6 lg:px-8">
+                    <div className="flex min-h-16 flex-col gap-3 py-3 md:flex-row md:items-center md:justify-between">
+                        <div>
+                            <p className="marketing-kicker">Eloquente</p>
+                            <h1 className="text-xl font-bold font-display text-slate-950">Marketing Executive Dashboard</h1>
                         </div>
-                            <div className="flex items-center gap-3">
-                                <div className="bg-green-100 text-green-800 text-xs px-2 py-1 rounded-full">Marketing View</div>
-                                <NotificationBell variant="dark" />
-                                <span className="text-gray-700">{user?.username}</span>
-                                <button onClick={handleLogout} className="text-sm text-gray-500 hover:text-gray-900">Logout</button>
-                            </div>
+                        <div className="flex flex-wrap items-center gap-3">
+                            <div className="rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1 text-xs font-black text-emerald-800">Live workspace</div>
+                            <NotificationBell variant="dark" />
+                            <span className="text-sm font-bold text-slate-700">{user?.username}</span>
+                            <button onClick={handleLogout} className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-bold text-slate-500 hover:text-slate-900">Logout</button>
+                        </div>
                     </div>
                 </div>
             </nav>
-            <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
-                {/* Tabs */}
-                <div className="border-b border-gray-200 mb-6">
-                    <nav className="-mb-px flex space-x-8">
-                        {['calendar', 'inquiries', 'documents', 'settings', 'messages'].map((tab) => (
+            <main className="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 lg:px-8">
+                <section className="marketing-command mb-5">
+                    <div>
+                        <p className="marketing-kicker">Marketing Operations</p>
+                        <h2 className="mt-1 text-2xl font-bold text-slate-950">Event pipeline</h2>
+                    </div>
+                    <div className="marketing-metrics">
+                        <div><span>Upcoming</span><strong>{dashboardSummary.upcoming}</strong></div>
+                        <div><span>Pending</span><strong>{dashboardSummary.pending}</strong></div>
+                        <div><span>This Month</span><strong>{dashboardSummary.monthEvents}</strong></div>
+                        <div><span>Pipeline</span><strong>PHP {formatMoney(dashboardSummary.pipeline)}</strong></div>
+                    </div>
+                </section>
+
+                <div className="marketing-nav-wrap mb-5">
+                    <nav className="marketing-nav">
+                        {['calendar', 'inquiries', 'documents', 'settings', 'messages'].map((tab) => {
+                            return (
                             <button
                                 key={tab}
                                 onClick={() => setActiveTab(tab)}
-                                className={`${activeTab === tab
-                                    ? 'border-primary-500 text-primary-600'
-                                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
-                                    } whitespace-nowrap py-4 px-1 border-b-2 font-medium text-sm capitalize flex items-center gap-1.5`}
+                                className={`marketing-tab ${activeTab === tab ? 'marketing-tab-active' : ''}`}
                             >
-                                {tab === 'messages' && (
-                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" /></svg>
-                                )}
-                                {tab}
+                                <span>{tabMeta[tab]}</span>
+                                {tab === 'inquiries' && dashboardSummary.pending > 0 && <em>{dashboardSummary.pending}</em>}
+                                {tab === 'calendar' && dashboardSummary.monthEvents > 0 && <em>{dashboardSummary.monthEvents}</em>}
                             </button>
-                        ))}
+                            );
+                        })}
                     </nav>
                 </div>
 
                 {activeTab === 'calendar' && (
-                    <div className="bg-white rounded-lg shadow p-6">
-                        <div className="flex justify-between items-center mb-4">
-                            <h2 className="text-lg font-bold text-gray-900">
-                                {selectedMonth.toLocaleString('default', { month: 'long', year: 'numeric' })}
-                            </h2>
-                            <div className="flex items-center space-x-2">
+                    <div className="marketing-panel p-5 lg:p-6">
+                        <div className="mb-5 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                            <div>
+                                <p className="marketing-kicker">Event Calendar</p>
+                                <h2 className="mt-1 text-2xl font-bold text-slate-950">
+                                    {selectedMonth.toLocaleString('default', { month: 'long', year: 'numeric' })}
+                                </h2>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
                                 <button
                                     onClick={() => setShowExportModal(true)}
-                                    className="bg-primary-600 hover:bg-primary-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center"
+                                    className="marketing-primary-btn flex items-center px-4 py-2 text-sm"
                                 >
                                     <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
                                     Export PDF
                                 </button>
                                 <button
                                     onClick={() => setSelectedMonth(new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() - 1))}
-                                    className="p-2 hover:bg-gray-100 rounded"
+                                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-bold text-slate-600 hover:bg-slate-50"
                                 >
-                                    &lt; Prev
+                                    Prev
                                 </button>
                                 <button
                                     onClick={() => setSelectedMonth(new Date(selectedMonth.getFullYear(), selectedMonth.getMonth() + 1))}
-                                    className="p-2 hover:bg-gray-100 rounded"
+                                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-bold text-slate-600 hover:bg-slate-50"
                                 >
-                                    Next &gt;
+                                    Next
                                 </button>
                             </div>
                         </div>
-                        <div className="grid grid-cols-7 gap-px bg-gray-200 border border-gray-200">
+                        <div className="grid grid-cols-7 overflow-hidden rounded-2xl border border-amber-100 bg-amber-100/70">
                             {['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(day => (
-                                <div key={day} className="bg-gray-50 py-2 text-center text-xs font-semibold text-gray-500 uppercase tracking-wide">
+                                <div key={day} className="bg-[#fffaf3] py-3 text-center text-xs font-black uppercase tracking-wide text-slate-500">
                                     {day}
                                 </div>
                             ))}
@@ -1354,5 +1372,3 @@ const DashboardMarketing = () => {
 };
 
 export default DashboardMarketing;
-
-

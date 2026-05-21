@@ -56,8 +56,10 @@ const BlueprintPanel = ({ bookingData, currentStep }) => {
 
     // Calculate menu total
     const menuTotal = useMemo(() => {
+        const extraSurcharge = bookingData.extraSurchargeTotal || 0;
+
         if (bookingData.package_base_price) {
-            return bookingData.package_base_price * pax;
+            return (bookingData.package_base_price * pax) + extraSurcharge;
         }
 
         let total = 0;
@@ -72,8 +74,8 @@ const BlueprintPanel = ({ bookingData, currentStep }) => {
                 }
             });
         });
-        return total;
-    }, [selectedDishes, pax, pricingOverrides, mergedDishes, bookingData.package_base_price]);
+        return total + extraSurcharge;
+    }, [selectedDishes, pax, pricingOverrides, mergedDishes, bookingData.package_base_price, bookingData.extraSurchargeTotal]);
 
     // Calculate surcharges
     const transportFee = useMemo(() => {
@@ -206,25 +208,52 @@ const BlueprintPanel = ({ bookingData, currentStep }) => {
                                         if (dishIds.length === 0) return null;
 
                                         return (
-                                            <div key={category}>
-                                                <p className="text-gray-500 text-[10px] font-semibold uppercase tracking-widest mb-2 border-b border-gray-800 pb-1">
-                                                    {CATEGORY_LABELS[category]}
+                                            <div key={category} className="animate-fadeIn">
+                                                <p className="text-gray-500 text-[10px] font-semibold uppercase tracking-widest mb-2 border-b border-gray-800 pb-1 flex justify-between items-center">
+                                                    <span>{CATEGORY_LABELS[category]}</span>
+                                                    <span className="text-[9px] text-gray-600 font-mono">
+                                                        {dishIds.length} selected
+                                                    </span>
                                                 </p>
-                                                <div className="space-y-1.5">
+                                                <div className="space-y-2">
                                                     {dishIds.map(id => {
                                                         const dish = mergedDishes[category]?.find(d => d.id === id);
                                                         if (!dish) return null;
+                                                        
                                                         const overrideId = `dish_${dish.id}`;
                                                         const customCost = pricingOverrides[overrideId] !== undefined ? pricingOverrides[overrideId] : dish.costPerHead;
-                                                        const cost = customCost * (pax || 0);
+                                                        
+                                                        const extraBreakdown = bookingData.extraDishesBreakdown || [];
+                                                        const extraMatch = extraBreakdown.find(extra => extra.id === id && extra.category === category);
+                                                        const isExtra = !!extraMatch;
+                                                        
+                                                        let costText = "";
+                                                        if (bookingData.package_base_price) {
+                                                            if (isExtra) {
+                                                                costText = `₱${extraMatch.totalCost?.toLocaleString() || ( (customCost + 50) * pax ).toLocaleString()}`;
+                                                            } else {
+                                                                costText = "Included";
+                                                            }
+                                                        } else {
+                                                            costText = `₱${(customCost * (pax || 0)).toLocaleString()}`;
+                                                        }
+
                                                         return (
-                                                            <div key={id} className="flex justify-between items-center text-sm animate-fadeIn group">
-                                                                <span className="text-gray-300 truncate mr-3 group-hover:text-white transition-colors">
-                                                                    <span className="text-red-900 mr-1.5 opacity-50">•</span>
-                                                                    {dish.name}
-                                                                </span>
-                                                                <span className="text-white font-medium whitespace-nowrap">
-                                                                    ₱{cost.toLocaleString()}
+                                                            <div key={id} className="flex justify-between items-start text-sm group py-0.5 animate-fadeIn">
+                                                                <div className="flex flex-col min-w-0 mr-3">
+                                                                    <span className="text-gray-300 truncate group-hover:text-white transition-colors flex items-center">
+                                                                        <span className={`${isExtra ? 'text-amber-500' : 'text-red-900'} mr-1.5 opacity-70`}>•</span>
+                                                                        {dish.name}
+                                                                    </span>
+                                                                    {isExtra && (
+                                                                        <span className="text-[10px] text-amber-500 font-bold ml-3 flex items-center gap-1 mt-0.5">
+                                                                            <svg className="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                                                                            Extra Selection (+₱50/head)
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                                <span className={`font-medium whitespace-nowrap ${costText === 'Included' ? 'text-emerald-500 text-[10px] uppercase font-bold bg-emerald-500/10 px-1.5 py-0.5 rounded border border-emerald-500/20' : (isExtra ? 'text-amber-500' : 'text-white')}`}>
+                                                                    {costText}
                                                                 </span>
                                                             </div>
                                                         );
@@ -233,6 +262,19 @@ const BlueprintPanel = ({ bookingData, currentStep }) => {
                                             </div>
                                         );
                                     })}
+
+                                    {/* Extra Surcharge summary line for custom canvas */}
+                                    {!bookingData.package_base_price && bookingData.extraSurchargeTotal > 0 && (
+                                        <div className="mt-4 pt-3 border-t border-gray-800 flex justify-between items-center text-sm font-medium text-amber-500 animate-fadeIn">
+                                            <span className="flex items-center gap-1.5">
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                                                Extra Selection Surcharges
+                                            </span>
+                                            <span>
+                                                +₱{bookingData.extraSurchargeTotal.toLocaleString()}
+                                            </span>
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>

@@ -91,33 +91,7 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
         return dish.costPerHead;
     };
 
-    // Calculate total from selections
-    const menuTotal = useMemo(() => {
-        if (bookingData.package_base_price) {
-            return bookingData.package_base_price * pax;
-        }
-
-        let total = 0;
-        Object.keys(selections).forEach(category => {
-            selections[category].forEach(id => {
-                const dish = mergedDishes[category]?.find(d => d.id === id);
-                if (dish) total += getDishCost(dish) * (pax || 0);
-            });
-        });
-        return total;
-    }, [selections, pax, pricingOverrides, bookingData.package_base_price]);
-
-    // Update parent whenever selections change
-    useEffect(() => {
-        if (phase === 'menu') {
-            updateBooking({
-                selectedDishes: selections,
-                totalCost: menuTotal
-            });
-        }
-    }, [selections, menuTotal, phase]);
-
-    // Per-category dish limits
+    // Per-category dish limits (standard fallback)
     const CATEGORY_LIMITS = {
         starter: 3,
         main: 4,
@@ -126,18 +100,127 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
         drink: 3
     };
 
-    // Toggle a dish selection (with category limit enforcement)
+    // Helper to get category limits (supports curated packages)
+    const getCategoryLimit = (category) => {
+        if (bookingData.package_id && bookingData.package_id !== 'custom') {
+            const pkg = curatedPackages.find(p => p.id === bookingData.package_id);
+            if (pkg && pkg.menu_structure) {
+                const keyMap = { starter: 'starters', main: 'mains', side: 'sides', dessert: 'desserts', drink: 'drinks' };
+                const dbKey = keyMap[category];
+                if (pkg.menu_structure[dbKey] !== undefined) {
+                    return pkg.menu_structure[dbKey];
+                }
+            }
+        }
+        return CATEGORY_LIMITS[category] || 5;
+    };
+
+    const EXTRA_DISH_SURCHARGE_PER_HEAD = 50;
+
+    // Calculate total and extra fees from selections
+    const menuCostDetails = useMemo(() => {
+        const keyMap = { starter: 'starters', main: 'mains', side: 'sides', dessert: 'desserts', drink: 'drinks' };
+        let baseTotal = 0;
+        let extraSurchargeTotal = 0;
+        let extraDishesCount = 0;
+        const extraDishesBreakdown = [];
+
+        if (bookingData.package_base_price) {
+            // CURATED PACKAGE CALCULATION
+            baseTotal = bookingData.package_base_price * (pax || 0);
+            
+            Object.keys(selections).forEach(category => {
+                const limit = getCategoryLimit(category);
+                const selectedIds = selections[category] || [];
+                if (selectedIds.length > limit) {
+                    // Do not sort - preserve selection order from selections array
+                    const dishes = selectedIds.map(id => mergedDishes[category]?.find(d => d.id === id)).filter(Boolean);
+                    const extras = dishes.slice(limit);
+                    
+                    extras.forEach(dish => {
+                        const dishCost = getDishCost(dish);
+                        const surcharge = EXTRA_DISH_SURCHARGE_PER_HEAD * (pax || 0);
+                        const dishTotalCost = dishCost * (pax || 0);
+                        const totalExtraCost = dishTotalCost + surcharge;
+                        
+                        extraSurchargeTotal += totalExtraCost;
+                        extraDishesCount++;
+                        extraDishesBreakdown.push({
+                            id: dish.id,
+                            name: dish.name,
+                            category,
+                            dishCost,
+                            surcharge: EXTRA_DISH_SURCHARGE_PER_HEAD,
+                            totalCost: totalExtraCost
+                        });
+                    });
+                }
+            });
+        } else {
+            // BLANK CANVAS / CUSTOM MENU CALCULATION
+            Object.keys(selections).forEach(category => {
+                const limit = getCategoryLimit(category);
+                const selectedIds = selections[category] || [];
+                
+                selectedIds.forEach((id, index) => {
+                    const dish = mergedDishes[category]?.find(d => d.id === id);
+                    if (dish) {
+                        const dishCost = getDishCost(dish);
+                        const cost = dishCost * (pax || 0);
+                        baseTotal += cost;
+                        
+                        // Check if this dish is an extra based on its index in the selection order
+                        const isExtra = index >= limit;
+                        
+                        if (isExtra) {
+                            const surcharge = EXTRA_DISH_SURCHARGE_PER_HEAD * (pax || 0);
+                            extraSurchargeTotal += surcharge;
+                            extraDishesCount++;
+                            extraDishesBreakdown.push({
+                                id: dish.id,
+                                name: dish.name,
+                                category,
+                                dishCost: 0, // already included in baseTotal
+                                surcharge: EXTRA_DISH_SURCHARGE_PER_HEAD,
+                                totalCost: surcharge
+                            });
+                        }
+                    }
+                });
+            });
+        }
+
+        return {
+            menuTotal: baseTotal + extraSurchargeTotal,
+            baseTotal,
+            extraSurchargeTotal,
+            extraDishesCount,
+            extraDishesBreakdown
+        };
+    }, [selections, pax, pricingOverrides, bookingData.package_base_price, bookingData.package_id, curatedPackages, customItems]);
+
+    const { menuTotal, extraSurchargeTotal, extraDishesCount, extraDishesBreakdown } = menuCostDetails;
+
+    // Update parent whenever selections change
+    useEffect(() => {
+        if (phase === 'menu') {
+            updateBooking({
+                selectedDishes: selections,
+                totalCost: menuTotal,
+                extraSurchargeTotal,
+                extraDishesCount,
+                extraDishesBreakdown
+            });
+        }
+    }, [selections, menuTotal, extraSurchargeTotal, extraDishesCount, extraDishesBreakdown, phase]);
+
+    // Toggle a dish selection (with soft limit over-limit behavior)
     const toggleDish = (category, dishId) => {
         setSelections(prev => {
             const currentList = prev[category];
             if (currentList.includes(dishId)) {
                 return { ...prev, [category]: currentList.filter(id => id !== dishId) };
             } else {
-                // Check limit
-                const limit = CATEGORY_LIMITS[category] || 5;
-                if (currentList.length >= limit) {
-                    return prev; // Don't add — limit reached
-                }
                 return { ...prev, [category]: [...currentList, dishId] };
             }
         });
@@ -169,7 +252,7 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
         while (changed) {
             changed = false;
             for (const cat of categories) {
-                const limit = CATEGORY_LIMITS[cat] || 5;
+                const limit = getCategoryLimit(cat);
                 if (newSelections[cat].length >= limit) continue; // Category full
 
                 // Find the next best dish in this category that fits the budget
@@ -290,6 +373,9 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
             selectedDishes: selections,
             customMenu: fullMenuSelection,
             totalCost: menuTotal,
+            extraSurchargeTotal,
+            extraDishesCount,
+            extraDishesBreakdown,
             budget: budget ? parseInt(budget) : 0
         });
         onNext(true);
@@ -575,6 +661,28 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
     // ==========================================
     // PHASE: TABULAR MENU BUILDER
     // ==========================================
+    const activeIndex = CATEGORY_TABS.findIndex(t => t.key === activeTab);
+
+    const handlePrevTab = () => {
+        if (activeIndex > 0) {
+            setActiveTab(CATEGORY_TABS[activeIndex - 1].key);
+        } else {
+            setPhase('path');
+        }
+    };
+
+    const handleNextTab = () => {
+        if (activeIndex < CATEGORY_TABS.length - 1) {
+            setActiveTab(CATEGORY_TABS[activeIndex + 1].key);
+        } else {
+            handleConfirmMenu();
+        }
+    };
+
+    const currentLimit = getCategoryLimit(activeTab);
+    const currentCount = selections[activeTab]?.length || 0;
+    const isOverLimit = currentCount > currentLimit;
+
     return (
         <div className="flex flex-col h-full animate-fadeIn">
             {/* Image Lightbox */}
@@ -604,39 +712,79 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
                     </div>
                 </div>
             )}
-            {/* Category Tabs */}
-            <div className="flex gap-1 mb-6 bg-gray-100 p-1 rounded-xl overflow-x-auto mt-2">
-                {CATEGORY_TABS.map(tab => {
-                    const count = selections[tab.key]?.length || 0;
-                    const limit = CATEGORY_LIMITS[tab.key] || 5;
-                    const isActive = activeTab === tab.key;
-                    const isFull = count >= limit;
-                    return (
-                        <button
-                            key={tab.key}
-                            onClick={() => setActiveTab(tab.key)}
-                            className={`flex-1 min-w-fit px-4 py-3 rounded-lg text-sm font-bold transition-all whitespace-nowrap ${isActive
-                                ? 'bg-white text-gray-900 shadow-sm'
-                                : 'text-gray-500 hover:text-gray-700'
-                                }`}
-                        >
-                            <TabIcon type={tab.key} className="w-4 h-4 inline-block mr-0.5" />
-                            {tab.label}
-                            <span className={`ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full font-bold ${isFull
-                                ? 'bg-green-100 text-green-700'
-                                : count > 0
-                                    ? (isActive ? 'bg-primary-100 text-primary-700' : 'bg-gray-200 text-gray-600')
-                                    : 'bg-gray-200 text-gray-400'
-                                }`}>
-                                {count}/{limit}
+
+            {/* Guided Progress Bar */}
+            <div className="mb-6 mt-2 space-y-3 bg-white p-5 rounded-2xl border border-gray-100/80 shadow-sm animate-fadeIn">
+                <div className="flex justify-between items-center text-xs font-bold uppercase tracking-wider text-gray-400">
+                    <span className="text-red-900 bg-red-50/60 px-3 py-1 rounded-full border border-red-100 font-bold">
+                        Step {activeIndex + 1} of {CATEGORY_TABS.length}
+                    </span>
+                    <span className="text-gray-500 font-mono font-bold">
+                        {Math.round(((activeIndex) / CATEGORY_TABS.length) * 100)}% Completed
+                    </span>
+                </div>
+                
+                {/* Progress Bar Track */}
+                <div className="relative h-2.5 w-full bg-gray-100 rounded-full overflow-hidden border border-gray-200/50">
+                    <div 
+                        className="absolute top-0 left-0 h-full bg-gradient-to-r from-red-900 to-red-800 rounded-full transition-all duration-500 ease-out shadow-sm"
+                        style={{ width: `${((activeIndex + 1) / CATEGORY_TABS.length) * 100}%` }}
+                    />
+                </div>
+                
+                {/* Milestones / Sub-step name */}
+                <div className="flex justify-between items-center text-sm pt-1">
+                    <div>
+                        <span className="text-gray-400 text-[10px] uppercase tracking-wider block font-bold">Current Phase</span>
+                        <span className="font-bold text-gray-900 text-base flex items-center gap-2 mt-0.5">
+                            <TabIcon type={activeTab} className="w-4.5 h-4.5 text-red-900" />
+                            {CATEGORY_TABS[activeIndex].label}
+                        </span>
+                    </div>
+                    <div className="text-right">
+                        <span className="text-gray-400 text-[10px] uppercase tracking-wider block font-bold">Selection Status</span>
+                        <span className={`inline-block mt-0.5 font-bold text-xs px-2.5 py-0.5 rounded-full ${
+                            isOverLimit
+                                ? 'bg-amber-100 text-amber-800 border border-amber-200/50'
+                                : currentCount === currentLimit
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-250/20'
+                                    : currentCount > 0
+                                        ? 'bg-red-50 text-red-900 border border-red-100'
+                                        : 'bg-gray-100 text-gray-450 border border-gray-200/40'
+                        }`}>
+                            {currentCount} / {currentLimit} {isOverLimit && 'Extra'}
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            {/* Selection Limit Info Alert */}
+            <div className="bg-amber-50/60 border border-amber-100/80 rounded-2xl p-4 mb-6 flex items-start gap-3 text-sm animate-fadeIn">
+                <svg className="w-5 h-5 text-amber-600 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <div className="flex-1">
+                    <p className="font-bold text-amber-900">
+                        {CATEGORY_TABS.find(t => t.key === activeTab)?.label} Selection Limit
+                    </p>
+                    <p className="text-amber-800 text-xs mt-0.5 leading-relaxed">
+                        You can choose up to <strong className="font-bold">{currentLimit}</strong> dishes. 
+                        You currently have <strong className="font-bold">{currentCount}</strong> selected.
+                        {isOverLimit ? (
+                            <span className="block mt-1 font-bold text-amber-950 bg-amber-100/50 p-2 rounded-lg border border-amber-250/30">
+                                ⚠️ You have selected {currentCount - currentLimit} extra dish(es). An additional fee of ₱{(50 * pax).toLocaleString()} (₱50 × {pax} guests) per extra dish will be added to the estimate.
                             </span>
-                        </button>
-                    );
-                })}
+                        ) : (
+                            <span className="block mt-0.5">
+                                Adding more than {currentLimit} dishes will incur a surcharge of ₱50 per guest per additional dish.
+                            </span>
+                        )}
+                    </p>
+                </div>
             </div>
 
             {/* Dish Grid */}
-            <div className="flex-1 overflow-y-auto max-h-[450px] pr-2 custom-scrollbar">
+            <div className="flex-1 overflow-y-auto max-h-[400px] pr-2 custom-scrollbar">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     {[...(mergedDishes[activeTab] || [])]
                         .sort((a, b) => {
@@ -644,22 +792,30 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
                             return getDishCost(a) - getDishCost(b);
                         })
                         .map(dish => {
-                            const isSelected = selections[activeTab]?.includes(dish.id);
+                            const selectedIds = selections[activeTab] || [];
+                            const isSelected = selectedIds.includes(dish.id);
+                            
+                            // Identify extra selection based on selection order index
+                            const selectedIndex = selectedIds.indexOf(dish.id);
+                            const isExtra = isSelected && selectedIndex >= currentLimit;
+                            
+                            const isOverLimitIfAdded = !isSelected && currentCount >= currentLimit;
                             const cost = getDishCost(dish);
-                            const categoryCount = selections[activeTab]?.length || 0;
-                            const categoryLimit = CATEGORY_LIMITS[activeTab] || 5;
-                            const isLimitReached = !isSelected && categoryCount >= categoryLimit;
 
                             return (
                                 <div
                                     key={dish.id}
-                                    className={`relative rounded-xl overflow-hidden border-2 transition-all duration-200 ${isSelected
-                                        ? 'border-primary-500 bg-primary-50 shadow-md'
-                                        : isLimitReached
-                                            ? 'border-gray-100 bg-gray-50 opacity-50'
+                                    className={`relative rounded-xl overflow-hidden border-2 transition-all duration-200 ${
+                                        isSelected
+                                            ? (isExtra ? 'border-amber-400 bg-amber-50/20 shadow-sm' : 'border-red-900/60 bg-red-50/20 shadow-sm')
                                             : 'border-gray-100 bg-white hover:border-gray-200'
-                                        }`}
+                                    }`}
                                 >
+                                    {isExtra && (
+                                        <span className="absolute top-2.5 right-2.5 bg-amber-500 text-white text-[8px] font-bold px-2 py-0.5 rounded-full z-10 animate-pulse tracking-wider">
+                                            EXTRA FEE
+                                        </span>
+                                    )}
                                     <div className="flex items-start gap-4 p-4">
                                         <div 
                                             className="relative w-20 h-20 rounded-lg overflow-hidden flex-shrink-0 bg-gray-200 cursor-pointer group/img"
@@ -683,12 +839,12 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
                                         </div>
 
                                         <div className="flex-1 min-w-0">
-                                            <h5 className={`font-bold text-sm mb-0.5 ${isSelected ? 'text-primary-900' : 'text-gray-900'}`}>
+                                            <h5 className={`font-bold text-sm mb-0.5 truncate ${isSelected ? (isExtra ? 'text-amber-850' : 'text-red-950') : 'text-gray-900'}`}>
                                                 {dish.name}
                                             </h5>
                                             <p className="text-xs text-gray-400 line-clamp-1 mb-2">{dish.description}</p>
                                             <div className="flex items-baseline justify-between gap-2">
-                                                <span className="text-primary-700 font-bold text-sm whitespace-nowrap">
+                                                <span className={`${isExtra ? 'text-amber-700' : 'text-red-950'} font-bold text-sm whitespace-nowrap`}>
                                                     ₱{cost}/head
                                                 </span>
                                                 {pax > 0 && (
@@ -701,15 +857,15 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
 
                                         <button
                                             onClick={() => toggleDish(activeTab, dish.id)}
-                                            disabled={isLimitReached}
-                                            className={`flex-shrink-0 px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wide transition-all self-center ${isSelected
-                                                ? 'bg-red-100 text-red-900 hover:bg-red-200'
-                                                : isLimitReached
-                                                    ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                                                    : 'bg-red-900 text-white hover:bg-red-800'
-                                                }`}
+                                            className={`flex-shrink-0 px-4 py-2 rounded-lg text-xs font-bold uppercase tracking-wide transition-all self-center shadow-sm ${
+                                                isSelected
+                                                    ? 'bg-red-100 text-red-900 hover:bg-red-200'
+                                                    : isOverLimitIfAdded
+                                                        ? 'bg-amber-500 text-white hover:bg-amber-600'
+                                                        : 'bg-red-900 text-white hover:bg-red-800'
+                                            }`}
                                         >
-                                            {isSelected ? 'Remove' : isLimitReached ? 'Full' : 'Add'}
+                                            {isSelected ? 'Remove' : isOverLimitIfAdded ? 'Add Extra' : 'Add'}
                                         </button>
                                     </div>
                                 </div>
@@ -721,14 +877,36 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
             {/* Bottom Bar */}
             <div className="flex justify-between pt-8 items-center border-t border-gray-100 mt-8">
                 <button
-                    onClick={() => setPhase('path')}
+                    onClick={handlePrevTab}
                     className="text-gray-500 font-medium hover:text-gray-800 px-4 py-3 transition-colors flex items-center text-sm"
                 >
                     <svg className="w-4 h-4 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
                     </svg>
-                    Go Back
+                    {activeIndex === 0 ? 'Go Back' : 'Previous Step'}
                 </button>
+
+                {/* Sub-step Progress indicator dots */}
+                <div className="hidden sm:flex items-center gap-2.5">
+                    {CATEGORY_TABS.map((tab, idx) => {
+                        const isCurrent = activeTab === tab.key;
+                        const isDone = selections[tab.key]?.length > 0;
+                        return (
+                            <button
+                                key={tab.key}
+                                onClick={() => setActiveTab(tab.key)}
+                                className={`h-2 rounded-full transition-all duration-300 ${
+                                    isCurrent 
+                                        ? 'w-8 bg-brand-gold shadow-sm' 
+                                        : isDone 
+                                            ? 'w-2 bg-emerald-500 hover:bg-emerald-600' 
+                                            : 'w-2 bg-gray-200 hover:bg-gray-300'
+                                }`}
+                                title={`Go to ${tab.label}`}
+                            />
+                        );
+                    })}
+                </div>
 
                 <div className="flex items-center gap-4">
                     <div className="text-right">
@@ -736,16 +914,17 @@ const MenuBuilder = ({ bookingData, updateBooking, onNext, onBack }) => {
                         <p className="text-xl font-bold text-gray-900">₱{menuTotal.toLocaleString()}</p>
                     </div>
                     <button
-                        onClick={handleConfirmMenu}
-                        disabled={totalDishCount === 0}
-                        className={`px-8 py-3.5 rounded-xl font-bold shadow-lg transition-all transform active:scale-95 flex items-center text-sm ${totalDishCount > 0
-                            ? 'bg-red-900 text-white hover:bg-red-800 hover:shadow-xl'
-                            : 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                            }`}
+                        onClick={handleNextTab}
+                        disabled={activeIndex === CATEGORY_TABS.length - 1 && totalDishCount === 0}
+                        className={`px-8 py-3.5 rounded-xl font-bold shadow-lg transition-all transform active:scale-95 flex items-center text-sm ${
+                            activeIndex === CATEGORY_TABS.length - 1 && totalDishCount === 0
+                                ? 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                                : 'bg-red-900 text-white hover:bg-red-800 hover:shadow-xl'
+                        }`}
                     >
-                        Confirm Menu
+                        {activeIndex === CATEGORY_TABS.length - 1 ? 'Confirm Menu' : 'Next Step'}
                         <svg className="w-4 h-4 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
                         </svg>
                     </button>
                 </div>

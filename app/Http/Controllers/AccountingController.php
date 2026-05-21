@@ -6,6 +6,7 @@ use App\Models\Booking;
 use App\Models\Payment;
 use App\Models\User;
 use App\Notifications\PaymentReminderNotification;
+use App\Services\BookingManagementService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
@@ -31,19 +32,74 @@ class AccountingController extends Controller
      * Get all bookings with their payment schedules.
      * Ported from: accountingController.getBookingsWithPayments()
      */
-    public function getBookingsWithPayments()
+    public function getBookingsWithPayments(Request $request)
     {
-        $bookings = Booking::with(['user:id,username', 'payments' => function ($q) {
-                $q->whereNotNull('payment_type')
+        $query = Booking::query()
+            ->select([
+                'id',
+                'user_id',
+                'event_date',
+                'pax',
+                'budget',
+                'total_cost',
+                'status',
+                'client_full_name',
+                'client_email',
+                'client_phone',
+                'created_at',
+            ])
+            ->with(['user:id,username', 'payments' => function ($q) {
+                $q->select([
+                    'id',
+                    'booking_id',
+                    'amount',
+                    'payment_method',
+                    'status',
+                    'payment_type',
+                    'due_date',
+                    'verified_by',
+                    'verified_at',
+                    'paymongo_checkout_session_id',
+                    'paymongo_payment_id',
+                    'paymongo_reference_number',
+                ])
+                  ->whereNotNull('payment_type')
                   ->orderByRaw("CASE payment_type WHEN 'Reservation' THEN 1 WHEN 'DownPayment' THEN 2 WHEN 'Final' THEN 3 ELSE 4 END")
                   ->orderBy('due_date')
                   ->orderBy('id');
             }])
             ->where('status', '!=', 'Cancelled')
-            ->where('status', '!=', 'Pending') // Do not show pending (unapproved) bookings
-            ->orderBy('event_date', 'asc')
-            ->get()
-            ->map(function ($b) {
+            ->where('status', '!=', 'Pending'); // Do not show pending (unapproved) bookings
+
+        if ($request->filled('search')) {
+            $search = trim((string) $request->query('search'));
+            $query->where(function ($inner) use ($search) {
+                $inner->where('client_full_name', 'like', "%{$search}%")
+                    ->orWhereHas('user', fn ($userQuery) => $userQuery->where('username', 'like', "%{$search}%"));
+                if (ctype_digit($search)) {
+                    $inner->orWhere('id', (int) $search);
+                }
+            });
+        }
+
+        if ($request->query('payment_status') === 'pending') {
+            $query->whereHas('payments', fn ($paymentQuery) => $paymentQuery->whereNotIn('status', ['Paid', 'Verified']));
+        } elseif ($request->query('payment_status') === 'complete') {
+            $query->whereHas('payments')
+                ->whereDoesntHave('payments', fn ($paymentQuery) => $paymentQuery->whereNotIn('status', ['Paid', 'Verified']));
+        }
+
+        match ($request->query('sort', 'eventDateSoonest')) {
+            'eventDateLatest' => $query->orderBy('event_date', 'desc'),
+            'bookingNewest' => $query->orderBy('created_at', 'desc'),
+            'bookingOldest' => $query->orderBy('created_at', 'asc'),
+            'clientAZ' => $query->orderBy('client_full_name', 'asc'),
+            'clientZA' => $query->orderBy('client_full_name', 'desc'),
+            default => $query->orderBy('event_date', 'asc'),
+        };
+
+        $perPage = min(max((int) $request->query('per_page', 25), 1), 100);
+        $bookings = $query->paginate($perPage)->through(function ($b) {
                 return array_merge($b->toArray(), [
                     'totalCost' => $b->total_cost ?? $b->budget ?? 0,
                     'username'  => $b->user->username ?? null,
@@ -259,7 +315,20 @@ class AccountingController extends Controller
      */
     public function getLedger(Request $request)
     {
-        $query = Payment::with(['booking:id,event_date,client_full_name,package_id,user_id', 'booking.user:id,username'])
+        $query = Payment::query()
+            ->select([
+                'id',
+                'booking_id',
+                'amount',
+                'payment_method',
+                'status',
+                'payment_type',
+                'due_date',
+                'verified_by',
+                'verified_at',
+                'created_at',
+            ])
+            ->with(['booking:id,event_date,client_full_name,package_id,user_id', 'booking.user:id,username'])
             ->whereHas('booking', function ($q) {
                 $q->whereNotIn('status', ['Pending', 'Cancelled']); // Hide ledger entries for unapproved/cancelled bookings
             });
@@ -432,30 +501,44 @@ class AccountingController extends Controller
     public function processRefund(int $bookingId, \App\Services\PayMongoService $payMongo)
     {
         $verifiedBy = Auth::user()->username ?? 'accounting';
+        $booking = Booking::with('payments')->find($bookingId);
+
+        if (!$booking) {
+            return response()->json(['error' => 'Booking not found.'], 404);
+        }
 
         $payments = Payment::where('booking_id', $bookingId)
             ->whereIn('status', ['Verified', 'Paid'])
+            ->orderByRaw("CASE payment_type WHEN 'Reservation' THEN 1 WHEN 'DownPayment' THEN 2 WHEN 'Final' THEN 3 ELSE 4 END")
+            ->orderBy('id')
             ->get();
 
         if ($payments->isEmpty()) {
             return response()->json(['error' => 'No verified or paid payments found for this booking to refund.'], 404);
         }
 
+        $impact = (new BookingManagementService())->calculateCancellationImpact($booking);
+        $remainingRefundable = round((float) ($impact['refundable_amount'] ?? 0), 2);
+        $nonRefundableRemaining = round((float) ($impact['non_refundable_amount'] ?? 0), 2);
         $refundCount = 0;
+        $forfeitedCount = 0;
         $errors = [];
 
         foreach ($payments as $payment) {
             try {
-                // Do not refund the reservation fee (10% non-refundable)
-                if ($payment->payment_type === 'Reservation') {
-                    // Mark as 'Forfeited' or leave it? We'll mark as Refunded so it's removed from queue,
-                    // but we won't process a real refund for it, keeping the money.
+                $paidAmount = round((float) $payment->amount, 2);
+                $forfeitedForPayment = min($paidAmount, $nonRefundableRemaining);
+                $nonRefundableRemaining = round($nonRefundableRemaining - $forfeitedForPayment, 2);
+                $refundAmount = min(round($paidAmount - $forfeitedForPayment, 2), $remainingRefundable);
+
+                if ($refundAmount <= 0) {
                     $payment->update([
                         'status'      => 'Refunded',
                         'verified_by' => $verifiedBy,
                         'verified_at' => now(),
-                        'payment_method' => $payment->payment_method . ' (Forfeited)'
+                        'payment_method' => trim(($payment->payment_method ?: 'Payment') . ' (Forfeited)')
                     ]);
+                    $forfeitedCount++;
                     continue;
                 }
 
@@ -464,15 +547,18 @@ class AccountingController extends Controller
                     try {
                         $payMongo->createRefund(
                             paymentId: $payment->paymongo_payment_id,
-                            amount: (float) $payment->amount,
+                            amount: $refundAmount,
                             reason: 'requested_by_customer',
-                            notes: "Refunded via Accounting Dashboard for Booking #{$bookingId}"
+                            notes: "Refunded via Accounting Dashboard for Booking #{$bookingId}, Payment #{$payment->id}"
                         );
                     } catch (\Exception $apiException) {
                         Log::error("PayMongo API failed for payment #{$payment->id}: " . $apiException->getMessage());
                         $errors[] = "Payment #{$payment->id} failed: " . $apiException->getMessage();
                         continue; // Skip local update if the real refund failed
                     }
+                } elseif (str_contains(strtolower((string) $payment->payment_method), 'paymongo')) {
+                    $errors[] = "Payment #{$payment->id} is missing the PayMongo payment ID needed for an API refund.";
+                    continue;
                 }
 
                 // Update the payment record
@@ -480,8 +566,12 @@ class AccountingController extends Controller
                     'status'      => 'Refunded',
                     'verified_by' => $verifiedBy,
                     'verified_at' => now(),
+                    'payment_method' => $forfeitedForPayment > 0
+                        ? trim(($payment->payment_method ?: 'Payment') . " (Partial refund: PHP " . number_format($refundAmount, 2) . "; forfeited: PHP " . number_format($forfeitedForPayment, 2) . ")")
+                        : $payment->payment_method,
                 ]);
 
+                $remainingRefundable = round($remainingRefundable - $refundAmount, 2);
                 $refundCount++;
             } catch (\Exception $e) {
                 Log::error("Failed to process refund for payment #{$payment->id}: " . $e->getMessage());
@@ -496,14 +586,19 @@ class AccountingController extends Controller
             ], 500);
         }
 
-        $message = "Refund processed successfully. Non-refundable reservation fees were forfeited.";
+        $message = $refundCount > 0
+            ? "Refund processed successfully through PayMongo where provider payment IDs were available. Non-refundable reservation fees were forfeited."
+            : "No refundable amount was available. Paid amounts were marked as forfeited.";
         if (count($errors) > 0) {
             $message .= " However, some payments failed to refund.";
         }
 
-        Log::info("[REFUND] Processed refund for booking #{$bookingId}. Updated records.");
+        Log::info("[REFUND] Processed refund for booking #{$bookingId}. Updated records.", [
+            'refunded_payments' => $refundCount,
+            'forfeited_payments' => $forfeitedCount,
+            'errors' => $errors,
+        ]);
 
         return response()->json(['success' => true, 'message' => $message]);
     }
 }
-

@@ -35,6 +35,7 @@ use Inertia\Inertia;
 
 Route::get('/', fn () => Inertia::render('LandingPage'))->name('home');
 Route::get('/about', fn () => Inertia::render('About'))->name('about');
+Route::get('/amenities', fn () => Inertia::render('Amenities'))->name('amenities');
 Route::get('/contact', fn () => Inertia::render('Contact'))->name('contact');
 Route::post('/webhook/paymongo', PayMongoWebhookController::class)->name('webhook.paymongo');
 
@@ -84,34 +85,40 @@ Route::middleware('auth')->group(function () {
 });
 
 // Public pricing endpoint (used by menu components)
-Route::get('/api/pricing', [AdminController::class, 'getPricingOverrides']);
+Route::get('/api/pricing', [AdminController::class, 'getPricingOverrides'])->middleware('cache.headers:public;max_age=120;etag');
 
 // Public custom menu items endpoint (used by menu components to merge with static catalog)
-Route::get('/api/menu-items', [AdminController::class, 'getMenuItems']);
+Route::get('/api/menu-items', [AdminController::class, 'getMenuItems'])->middleware('cache.headers:public;max_age=120;etag');
 
 // Public food tasting (guests can submit without auth)
 Route::post('/api/food-tasting', [FoodTastingController::class, 'store']);
 
 // Booking availability is public (calendar needs it without auth sometimes)
-Route::get('/api/bookings/availability/{date}', [BookingController::class, 'checkAvailability']);
+Route::get('/api/bookings/availability/{date}', [BookingController::class, 'checkAvailability'])->middleware('cache.headers:public;max_age=60;etag');
 // Issue 3: Pre-fetch all blocked dates for the calendar UI
-Route::get('/api/bookings/disabled-dates', [BookingController::class, 'getDisabledDates']);
+Route::get('/api/bookings/disabled-dates', [BookingController::class, 'getDisabledDates'])->middleware('cache.headers:public;max_age=60;etag');
 
 // ─── Menu API Endpoints (Database-backed) ───
-Route::get('/api/menu', [MenuController::class, 'index']);
-Route::get('/api/menu/categories', [MenuController::class, 'categories']);
-Route::get('/api/menu/bestsellers', [MenuController::class, 'bestsellers']);
-Route::get('/api/menu/{id}', [MenuController::class, 'show']);
+Route::middleware('cache.headers:public;max_age=300;etag')->group(function () {
+    Route::get('/api/menu', [MenuController::class, 'index']);
+    Route::get('/api/menu/categories', [MenuController::class, 'categories']);
+    Route::get('/api/menu/bestsellers', [MenuController::class, 'bestsellers']);
+    Route::get('/api/menu/{id}', [MenuController::class, 'show']);
+});
 
 // Event types API
-Route::get('/api/event-types', [EventTypeController::class, 'index']);
-Route::get('/api/event-types/slug/{slug}', [EventTypeController::class, 'bySlug']);
-Route::get('/api/event-types/{id}', [EventTypeController::class, 'show']);
+Route::middleware('cache.headers:public;max_age=300;etag')->group(function () {
+    Route::get('/api/event-types', [EventTypeController::class, 'index']);
+    Route::get('/api/event-types/slug/{slug}', [EventTypeController::class, 'bySlug']);
+    Route::get('/api/event-types/{id}', [EventTypeController::class, 'show']);
+});
 
 // Packages API
-Route::get('/api/packages', [PackageController::class, 'index']);
-Route::get('/api/packages/type/{type}', [PackageController::class, 'byType']);
-Route::get('/api/packages/{id}', [PackageController::class, 'show']);
+Route::middleware('cache.headers:public;max_age=300;etag')->group(function () {
+    Route::get('/api/packages', [PackageController::class, 'index']);
+    Route::get('/api/packages/type/{type}', [PackageController::class, 'byType']);
+    Route::get('/api/packages/{id}', [PackageController::class, 'show']);
+});
 
 // ─── Client Routes ───
 
@@ -127,7 +134,7 @@ Route::middleware(['auth', 'role:Client'])->group(function () {
     Route::post('/checkout/initialize', [PaymentController::class, 'initializeCheckout'])->name('checkout.initialize');
     Route::get('/checkout/secure', [PaymentController::class, 'showSecureCheckout'])->middleware('signed')->name('checkout.secure');
     Route::post('/checkout/process', [PaymentController::class, 'processPayment'])->name('checkout.process');
-    Route::get('/checkout/success', fn () => Inertia::render('client/PaymentSuccess'))->name('checkout.success');
+    Route::get('/checkout/success', [PaymentController::class, 'success'])->name('checkout.success');
     Route::get('/checkout/cancelled', fn () => Inertia::render('client/PaymentCancelled'))->name('checkout.cancelled');
 
     // Dashboard data API (used by original ClientDashboard.jsx fetch calls)
@@ -135,6 +142,7 @@ Route::middleware(['auth', 'role:Client'])->group(function () {
 
     // Booking API endpoints (JSON responses for React AJAX calls)
     Route::post('/api/bookings', [BookingController::class, 'store']);
+    Route::post('/api/bookings/abandoned-reminder', [BookingController::class, 'sendAbandonedReminder']);
     Route::put('/api/bookings/{id}/event-details', [BookingController::class, 'updateEventDetails']);
     Route::put('/api/bookings/{id}/menu', [BookingController::class, 'updateMenu']);
     Route::put('/api/bookings/{id}/cancel', [BookingController::class, 'cancel']);
@@ -198,6 +206,9 @@ Route::middleware(['auth', 'role:Admin'])->group(function () {
     Route::put('/api/admin/bookings/{id}/status', [AdminController::class, 'updateBookingStatus']);
     Route::post('/api/admin/bookings/{id}/discount', [AdminController::class, 'applyDiscount']);
     Route::get('/api/admin/analytics', [AdminController::class, 'getAnalytics']);
+    Route::get('/api/admin/audits', [AdminController::class, 'getAudits']);
+    Route::get('/api/admin/refunds/queue', [AccountingController::class, 'getRefundQueue']);
+    Route::post('/api/admin/refund/{bookingId}', [AccountingController::class, 'processRefund']);
 
     // Menu items CRUD
     Route::post('/api/admin/menu-items', [AdminController::class, 'createMenuItem']);

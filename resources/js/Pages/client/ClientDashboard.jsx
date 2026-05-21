@@ -4,7 +4,7 @@ import { router } from '@inertiajs/react';
 import ChatBubble from '../../Components/common/ChatBubble';
 import { fetchMenuItemsFromAPI } from '../../utils/menuUtils';
 import ClientNavbar from '../../Components/common/ClientNavbar';
-import ReceiptModal from '../../components/common/ReceiptModal';
+import ReceiptModal from '../../Components/common/ReceiptModal';
 
 const peso = (value) => `₱${Number(value || 0).toLocaleString()}`;
 const settledStatuses = ['Paid', 'Verified'];
@@ -16,6 +16,27 @@ const menuCategories = [
     { id: 'dessert', label: 'Desserts' },
     { id: 'drink', label: 'Refreshments' },
 ];
+const dashboardSections = ['details', 'menu', 'tastings', 'payments', 'history'];
+
+const readStoredDashboardValue = (key, fallback = null) => {
+    if (typeof window === 'undefined') return fallback;
+
+    try {
+        return localStorage.getItem(key) || fallback;
+    } catch (e) {
+        return fallback;
+    }
+};
+
+const writeStoredDashboardValue = (key, value) => {
+    if (typeof window === 'undefined' || value === null || value === undefined) return;
+
+    try {
+        localStorage.setItem(key, String(value));
+    } catch (e) {
+        // Ignore storage errors so dashboard navigation still works normally.
+    }
+};
 
 const buildJourneySteps = (booking, payments) => {
     const bookingPayments = payments.filter((payment) => payment.booking_id === booking.id);
@@ -91,10 +112,19 @@ const HistoryPanel = ({ bookings, onRemove }) => (
 
 const ClientDashboard = () => {
     const { user, logout } = useAuth();
+    const dashboardStoragePrefix = `ecs_client_dashboard_${user?.id || 'guest'}`;
+    const activeBookingStorageKey = `${dashboardStoragePrefix}_active_booking_id`;
+    const activeSectionStorageKey = `${dashboardStoragePrefix}_active_section`;
     const [data, setData] = useState({ bookings: [], historyBookings: [], tastings: [], payments: [] });
     const [loading, setLoading] = useState(true);
-    const [activeBookingId, setActiveBookingId] = useState(null);
-    const [activeSection, setActiveSection] = useState('details'); // details, menu, payments
+    const [activeBookingId, setActiveBookingId] = useState(() => {
+        const stored = readStoredDashboardValue(activeBookingStorageKey);
+        return stored ? Number(stored) : null;
+    });
+    const [activeSection, setActiveSection] = useState(() => {
+        const stored = readStoredDashboardValue(activeSectionStorageKey, 'details');
+        return dashboardSections.includes(stored) ? stored : 'details';
+    });
     const [toast, setToast] = useState(null);
     const [detailsForm, setDetailsForm] = useState({});
     const [savingDetails, setSavingDetails] = useState(false);
@@ -128,12 +158,22 @@ const ClientDashboard = () => {
 
     useEffect(() => {
         const tab = new URLSearchParams(window.location.search).get('tab');
-        if (['details', 'menu', 'tastings', 'payments', 'history'].includes(tab)) {
+        if (dashboardSections.includes(tab)) {
             setActiveSection(tab);
         }
         fetchData();
         fetchMenuItemsFromAPI().then(setMenuCatalog);
     }, []);
+
+    useEffect(() => {
+        if (activeBookingId) {
+            writeStoredDashboardValue(activeBookingStorageKey, activeBookingId);
+        }
+    }, [activeBookingId, activeBookingStorageKey]);
+
+    useEffect(() => {
+        writeStoredDashboardValue(activeSectionStorageKey, activeSection);
+    }, [activeSection, activeSectionStorageKey]);
 
     useEffect(() => {
         const booking = data.bookings.find(b => b.id === activeBookingId);
@@ -186,7 +226,10 @@ const ClientDashboard = () => {
                     payments: result.payments || [],
                 });
                 const activeBookings = result.bookings || [];
-                if (activeBookings.length > 0 && (!activeBookingId || !activeBookings.some((booking) => booking.id === activeBookingId))) {
+                const storedBookingId = Number(readStoredDashboardValue(activeBookingStorageKey));
+                const preferredBookingId = activeBookingId || storedBookingId || null;
+
+                if (activeBookings.length > 0 && (!preferredBookingId || !activeBookings.some((booking) => booking.id === preferredBookingId))) {
                     // Default to the event with the closest upcoming date
                     const now = new Date();
                     const sorted = [...activeBookings].sort((a, b) => {
@@ -195,6 +238,8 @@ const ClientDashboard = () => {
                         return da - db;
                     });
                     setActiveBookingId(sorted[0].id);
+                } else if (preferredBookingId) {
+                    setActiveBookingId(preferredBookingId);
                 } else if (activeBookings.length === 0) {
                     setActiveBookingId(null);
                 }

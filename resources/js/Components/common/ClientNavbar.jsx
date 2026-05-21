@@ -10,6 +10,7 @@ const ClientNavbar = ({ user, logout, activePath }) => {
     const links = [
         { n: 'Home', p: '/' },
         { n: 'About', p: '/about' },
+        { n: 'Amenities', p: '/amenities' },
         { n: 'Menu', p: '/menu' },
         { n: 'Book Now', p: '/book' },
         { n: 'Contact', p: '/contact' },

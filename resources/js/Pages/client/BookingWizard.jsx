@@ -1,145 +1,38 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { router, Link } from '@inertiajs/react';
 import axios from 'axios';
 import { useAuth } from '../../context/AuthContext';
 import { useToast } from '../../context/ToastContext';
-import CalendarView from '../../components/client/CalendarView';
-import EventIdentity from '../../components/client/EventIdentity';
-import GuestLogistics from '../../components/client/GuestLogistics';
-import MenuBuilder from '../../components/client/MenuBuilder';
-import EventSurcharges from '../../components/client/EventSurcharges';
-import FoodTastingStep from '../../components/client/FoodTastingStep';
-import BlueprintPanel from '../../components/client/BlueprintPanel';
-import Modal from '../../components/common/Modal';
-import UserDropdown from '../../components/common/UserDropdown';
+import useBookingDraft, { saveBookingDraft } from '../../hooks/useBookingDraft';
+import CalendarView from '../../Components/client/CalendarView';
+import EventIdentity from '../../Components/client/EventIdentity';
+import GuestLogistics from '../../Components/client/GuestLogistics';
+import MenuBuilder from '../../Components/client/MenuBuilder';
+import EventSurcharges from '../../Components/client/EventSurcharges';
+import FoodTastingStep from '../../Components/client/FoodTastingStep';
+import BlueprintPanel from '../../Components/client/BlueprintPanel';
+import Modal from '../../Components/common/Modal';
+import UserDropdown from '../../Components/common/UserDropdown';
 import NotificationBell from '../../Components/common/NotificationBell';
 import ChatBubble from '../../Components/common/ChatBubble';
 import logoImg from '../../../images/ECS_LOGO.png';
 import ClientNavbar from '../../Components/common/ClientNavbar';
 
-const STORAGE_KEY = 'ecs_booking_draft';
-
-const defaultBookingData = {
-    date: null, time: '', duration: 4, remainingPax: null,
-    eventType: '',
-    pax: 20, dietaryNotes: '',
-    budget: 0, selectedDishes: { starter: [], main: [], side: [], dessert: [], drink: [] }, customMenu: {}, totalCost: 0,
-    client_full_name: '', venue_address_line: '', venue_street: '', venue_city: '', venue_province: '', venue_zip_code: '', client_email: '', client_phone: '', venueDistance: 'metro-manila', isHighRise: false,
-    wantsTasting: false, tasting_guest_name: '', tasting_guest_email: '', tasting_guest_phone: '', tasting_preferred_date: '', tasting_preferred_time: '', tasting_notes: ''
-};
-
-const ACTIVE_KEY = 'ecs_booking_active';
-
 const BookingWizard = () => {
     const { user } = useAuth();
     const toast = useToast();
-    const [showResumeModal, setShowResumeModal] = useState(false);
-    const [resumeStep, setResumeStep] = useState(1);
-    const initDone = useRef(false);
-
-    // Helper to prevent draft bleed-over between users
-    const isValidDraft = (d) => {
-        return d._user_id === undefined || d._user_id === null || d._user_id === user?.id;
-    };
-
-    // Restore from localStorage on mount (persists across logout/login)
-    const [currentStep, setCurrentStep] = useState(() => {
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) { 
-                const d = JSON.parse(saved); 
-                if (isValidDraft(d)) return d._step || 1;
-            }
-        } catch(e) {}
-        return 1;
-    });
     const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-    const [bookingData, setBookingData] = useState(() => {
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) { 
-                const d = JSON.parse(saved); 
-                if (isValidDraft(d)) {
-                    const { _step, _user_id, ...rest } = d; 
-                    return { ...defaultBookingData, ...rest }; 
-                }
-            }
-        } catch(e) {}
-        return { ...defaultBookingData };
-    });
-
-    // Show resume modal ONLY if user is re-entering (active flag missing), not on reload
-    useEffect(() => {
-        if (initDone.current) return;
-        initDone.current = true;
-        const wasActive = sessionStorage.getItem(ACTIVE_KEY);
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved && !wasActive) {
-                const d = JSON.parse(saved);
-                if (isValidDraft(d)) {
-                    if (d._customPackageFromMenu) {
-                        // Custom package from Menu page - show message instead of resume modal
-                        toast.success('Your custom package is ready! Fill in the event details to complete your booking.');
-                    } else if (d._step && d._step > 1) {
-                        setResumeStep(d._step);
-                        setShowResumeModal(true);
-                    }
-                }
-            }
-        } catch(e) {}
-        // Set active flag so reloads won't trigger the modal
-        sessionStorage.setItem(ACTIVE_KEY, '1');
-    }, [user]);
-
-    // Persist to localStorage on every change (survives logout/login)
-    useEffect(() => {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ 
-            ...bookingData, 
-            _step: currentStep,
-            _user_id: user?.id || null 
-        }));
-    }, [bookingData, currentStep, user]);
-
-    // Show toast when navigating away
-    useEffect(() => {
-        const removeStartListener = router.on('start', (event) => {
-            // Only show toast if navigating away from the booking process
-            const url = event.detail.visit.url;
-            const path = typeof url === 'string' ? url : url?.pathname || '';
-            if (!path.includes('/book')) {
-                // Clear the active flag so if they return in the same session, they get prompted again
-                sessionStorage.removeItem(ACTIVE_KEY);
-                
-                const saved = localStorage.getItem(STORAGE_KEY);
-                if (saved) {
-                    const d = JSON.parse(saved);
-                        if (d._step && d._step > 1) {
-                        toast.success('Your booking progress has been saved. You can resume anytime.');
-                    }
-                }
-            }
-        });
-        return () => removeStartListener();
-    }, [toast]);
-
-    const clearDraft = () => {
-        localStorage.removeItem(STORAGE_KEY);
-        sessionStorage.removeItem(ACTIVE_KEY);
-    };
-
-    const handleResumeContinue = () => setShowResumeModal(false);
-    const handleResumeStartFresh = () => {
-        setBookingData({ ...defaultBookingData });
-        setCurrentStep(1);
-        clearDraft();
-        sessionStorage.setItem(ACTIVE_KEY, '1'); // re-set since we're still on the page
-        setShowResumeModal(false);
-    };
-
-    const updateBooking = (data) => {
-        setBookingData(prev => ({ ...prev, ...data }));
-    };
+    const {
+        bookingData,
+        clearDraft,
+        currentStep,
+        handleResumeContinue,
+        handleResumeStartFresh,
+        resumeStep,
+        setCurrentStep,
+        showResumeModal,
+        updateBooking,
+    } = useBookingDraft(user, toast);
 
     const validateStep = (stepToValidate, dataToValidate = bookingData) => {
         if (stepToValidate === 1) {
@@ -239,7 +132,7 @@ const BookingWizard = () => {
 
         if (!user) {
             // Save current booking progress so they can resume after registering
-            localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...merged, _step: currentStep }));
+            saveBookingDraft(merged, currentStep);
             showModal('error', 'Account Required', 'You need to create an account to submit your booking. Your progress has been saved — you can resume after registering.', () => router.get('/register'), 'Register Now');
             return;
         }
@@ -494,7 +387,7 @@ const BookingWizard = () => {
                 confirmText={modal.confirmText}
             />
 
-            <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
                 {/* Back to Home Button */}
                 <div className="mb-6">
                     <Link href="/" className="inline-flex items-center text-sm font-medium text-gray-500 hover:text-red-900 transition-colors">
@@ -532,7 +425,7 @@ const BookingWizard = () => {
                                 <div
                                     className="absolute top-1/2 left-0 h-0.5 -z-10 transform -translate-y-1/2 rounded-full transition-all duration-700 ease-out"
                                     style={{ width: `${((currentStep - 1) / (totalSteps - 1)) * 100}%`, background: 'linear-gradient(90deg, #7f1d1d, #eab308)' }}
-                                />
+                                  />
                                 {stepLabels.map((item) => (
                                     <button 
                                         key={item.step} 
@@ -617,7 +510,7 @@ const BookingWizard = () => {
                     </div>
 
                     {/* Right: Booking Summary Sidebar */}
-                    <div className="w-full lg:w-80 flex-shrink-0 animate-fadeInRight">
+                    <div className="w-full lg:w-[380px] flex-shrink-0 animate-fadeInRight">
                         <BlueprintPanel
                             bookingData={bookingData}
                             currentStep={currentStep}
@@ -641,4 +534,3 @@ const BookingWizard = () => {
 };
 
 export default BookingWizard;
-

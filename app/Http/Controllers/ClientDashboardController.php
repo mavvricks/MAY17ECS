@@ -5,8 +5,9 @@ namespace App\Http\Controllers;
 use App\Models\Booking;
 use App\Models\FoodTasting;
 use App\Models\Payment;
+use App\Services\BookingManagementService;
+use App\Services\PaymentCalculationService;
 use Illuminate\Support\Facades\Auth;
-use Inertia\Inertia;
 
 /**
  * Ported from: server/controllers/clientDashboardController.js
@@ -18,16 +19,18 @@ class ClientDashboardController extends Controller
      * JSON API endpoint — returns dashboard data for the original ClientDashboard.jsx
      * which fetches via fetch('/api/dashboard/client').
      */
-    public function apiData()
+    public function apiData(PaymentCalculationService $paymentService, BookingManagementService $bookingService)
     {
         $userId = Auth::id();
 
         $allBookings = Booking::where('user_id', $userId)
             ->orderBy('event_date', 'desc')
-            ->get()
-            ->map(function ($booking) {
-                $paymentService = new \App\Services\PaymentCalculationService();
-                $bookingService = new \App\Services\BookingManagementService();
+            ->get();
+
+        $allBookings->each(fn ($booking) => $paymentService->syncPendingTranches($booking));
+
+        $allBookings = $allBookings
+            ->map(function ($booking) use ($paymentService, $bookingService) {
                 $bookingArray = $booking->toArray();
                 $bookingArray['nextPaymentDue'] = $paymentService->getNextPaymentDue($booking);
                 $bookingArray['canEditSupplementary'] = $bookingService->canEditSupplementary($booking);
